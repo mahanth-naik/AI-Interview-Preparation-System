@@ -4,6 +4,7 @@ from pathlib import Path
 from pypdf import PdfReader
 
 from services.chunking import chunk_text
+import services.rag
 
 app = FastAPI(title="AI Interview Preparation System")
 
@@ -73,4 +74,17 @@ def search_documents(query: str, n_results: int = 3):
     return {
         "query": query,
         "results": matches
+    }
+@app.get("/ask")
+def ask_question(query: str, n_results: int = 3):
+    results = search_chunks(query, n_results)
+
+    documents = results.get("documents", [[]])[0]
+
+    context = services.rag.build_context(documents)
+
+    return {
+        "question": query,
+        "retrieved_chunks": len(documents),
+        "context": context
     }

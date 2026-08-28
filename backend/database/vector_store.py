@@ -13,20 +13,15 @@ def add_chunks(chunks: list[str], filename: str):
         for i in range(len(chunks))
     ]
 
-    # Remove existing chunks for this file
-    existing = collection.get(
-        where={"filename": filename}
-    )
-
-    if existing["ids"]:
-        collection.delete(ids=existing["ids"])
-
     collection.add(
         documents=chunks,
         ids=ids,
         metadatas=[
-            {"filename": filename}
-            for _ in chunks
+            {
+                "filename": filename,
+                "chunk_index": i
+            }
+            for i in range(len(chunks))
         ]
     )
 
