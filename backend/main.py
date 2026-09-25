@@ -5,6 +5,7 @@ from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
 from services.chunking import chunk_text
+from services.ai_provider import LLMConfigurationError, LLMProviderError
 from services.interview import InterviewService
 from services.rag import build_context, retrieve_context
 
@@ -122,7 +123,8 @@ def start_interview(request: StartInterviewRequest):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"session_id": session.session_id, "role": session.role, "interview_type": session.interview_type,
-            "difficulty": session.difficulty, "number_of_questions": len(session.questions), "provider": "local"}
+        "difficulty": session.difficulty, "number_of_questions": request.number_of_questions,
+        "provider": interview_service.provider.name}
 
 
 @app.post("/interview/question")
@@ -131,6 +133,8 @@ def get_question(request: QuestionRequest):
         return interview_service.next_question(request.session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Interview session not found") from exc
+    except (LLMConfigurationError, LLMProviderError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/interview/evaluate")
@@ -139,6 +143,8 @@ def evaluate_answer(request: EvaluationRequest):
         return interview_service.evaluate(request.session_id, request.question, request.answer)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Interview session not found") from exc
+    except (LLMConfigurationError, LLMProviderError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/interview/{session_id}")

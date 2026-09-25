@@ -1,32 +1,33 @@
 # AI Interview Preparation System
 
-Backend foundation for a college Additional Project (ADP) that prepares candidates
-for interviews using document retrieval and an interview-session workflow. The
-frontend is not implemented yet.
+Backend foundation for a college Additional Project (ADP) that prepares candidates for interviews using document retrieval and an interview-session workflow. The frontend is not implemented yet.
 
 ## Current Progress
 
-Weeks 1-4 are complete for the backend foundation: PDF ingestion, text chunking,
-Chroma vector storage, semantic retrieval, offline question generation, answer
-evaluation, and in-memory interview sessions. AutoGen and an external LLM are not
-currently installed or integrated.
+The backend supports PDF ingestion, text chunking, ChromaDB semantic retrieval, RAG-backed interview turns, an LLM provider abstraction, structured answer evaluation, and AutoGen interviewer/evaluator orchestration. The local provider is the default, so development and tests work without an API key.
 
 ## Architecture
 
 ```text
 PDF resume/document
-	-> pypdf text extraction
-	-> validated text chunks
-	-> ChromaDB persistent vector collection
-	-> semantic retrieval
-	-> local interview provider
-	-> questions and structured answer feedback
+  -> pypdf text extraction
+  -> validated text chunks
+  -> ChromaDB persistent vector collection
+  -> retrieval for each interview turn
+  -> retrieval/context construction
+  -> AutoGen SelectorGroupChat -> InterviewerAgent -> question
+  -> AutoGen SelectorGroupChat -> EvaluatorAgent -> structured evaluation
 ```
 
-The backend keeps route handling in `main.py`. Chunking, retrieval, AI-provider,
-and session logic live under `backend/services/`. Chroma data is persisted under
-`backend/database/chroma/`, and uploaded source files are kept under
-`backend/uploads/` for local development.
+```text
+start session -> retrieve context -> generate question
+       ^                                  |
+       |                                  v
+next question <- evaluate answer <- submit answer
+                 (difficulty and follow-up update)
+```
+
+The backend keeps route handling in `main.py`. Chunking, retrieval, provider, orchestration, and session logic live under `backend/services/`. Chroma data is persisted under `backend/database/chroma/` and uploaded source files are kept under `backend/uploads/` for local development.
 
 ## API
 
@@ -34,39 +35,29 @@ and session logic live under `backend/services/`. Chroma data is persisted under
 | --- | --- | --- |
 | GET | `/` | API status message |
 | GET | `/health` | Health check |
-| POST | `/documents/upload` | Upload a readable PDF, extract text, chunk it, and store vectors |
-| GET | `/documents/search?query=Python&n_results=3` | Return relevant chunks with source and distance |
-| GET | `/ask?query=Python&n_results=3` | Backward-compatible retrieval context response |
-| POST | `/interview/start` | Create a session and generate role-specific questions from retrieved context |
-| POST | `/interview/question` | Return the current question for a session |
+| POST | `/documents/upload` | Extract and store a readable PDF |
+| GET | `/documents/search?query=Python&n_results=3` | Return relevant chunks |
+| GET | `/ask?query=Python&n_results=3` | Backward-compatible context response |
+| POST | `/interview/start` | Create a session |
+| POST | `/interview/question` | Generate or return the current question |
 | POST | `/interview/evaluate` | Evaluate an answer and advance the session |
-| GET | `/interview/{session_id}` | Return session state, answers, and evaluations |
+| GET | `/interview/{session_id}` | Return session state |
 
-Example start request:
+Evaluation responses retain `score`, `feedback`, `strengths`, and `improvements`. They also contain validated dimension scores, weaknesses, improvement suggestions, `follow_up_required`, and `next_difficulty`.
 
-```json
-{
-	"role": "Python Developer",
-	"interview_type": "technical",
-	"difficulty": "medium",
-	"number_of_questions": 5
-}
+## LLM Configuration
+
+Copy `.env.example` to `.env` and set the provider as needed:
+
+```text
+LLM_PROVIDER=local
+LLM_MODEL=gpt-4o-mini
+OPENAI_API_KEY=
 ```
 
-The response includes a `session_id`, question count, and `provider: "local"`.
-Evaluation responses contain `score`, `feedback`, `strengths`, and `improvements`.
-
-## Technologies
-
-- Python 3.14
-- FastAPI and Pydantic
-- pypdf
-- ChromaDB
-- pytest
+Use `LLM_PROVIDER=openai` for direct OpenAI chat completions or `LLM_PROVIDER=autogen` for the AutoGen adapter. The AutoGen adapter creates two distinct `AssistantAgent` instances in one `SelectorGroupChat`: `InterviewerAgent` generates one question and `EvaluatorAgent` returns `EvaluationResult` JSON. Retrieval remains in `InterviewService`; the resulting context is passed into each agent task. The API key is read from the environment only and is never stored in source code. `local` is the offline default.
 
 ## Setup and Run (Windows PowerShell)
-
-Use the existing project environment:
 
 ```powershell
 cd C:\Users\mahan\OneDrive\Desktop\AI-Interview-Preparation-System
@@ -76,10 +67,9 @@ cd .\backend
 python -m uvicorn main:app --reload
 ```
 
-The API is available at `http://127.0.0.1:8000`; interactive documentation is
-available at `/docs`.
+The API is available at `http://127.0.0.1:8000`; interactive documentation is available at `/docs`.
 
-## Testing and Validation
+## Testing
 
 ```powershell
 cd C:\Users\mahan\OneDrive\Desktop\AI-Interview-Preparation-System\backend
@@ -87,38 +77,33 @@ cd C:\Users\mahan\OneDrive\Desktop\AI-Interview-Preparation-System\backend
 .\venv\Scripts\python.exe -m compileall -q main.py services database tests
 ```
 
-The test suite uses the local provider and mocks retrieval where appropriate, so
-it does not make paid API calls. No API key is required for the current provider.
-If a real LLM provider is added later, credentials must come from environment
-variables and never from source code.
+Tests use fake LLM clients and mocked retrieval, so they do not make paid API calls. They cover missing configuration, malformed responses, RAG-backed question generation, structured evaluation, provider selection, and AutoGen role orchestration. On the current Windows environment, test collection is blocked before any test body runs because Application Control blocks the installed `pydantic_core` DLL. No test pass result is claimed until that environment restriction is resolved by its administrator.
 
 ## Project Structure
 
 ```text
 backend/
-	main.py
-	requirements.txt
-	database/
-		vector_store.py
-		chroma/                 # ignored generated data
-	services/
-		chunking.py
-		rag.py
-		ai_provider.py
-		interview.py
-	tests/
-		test_backend.py
-	uploads/                  # ignored local uploads
+  main.py
+  requirements.txt
+  database/
+    vector_store.py
+    chroma/                 # ignored generated data
+  services/
+    chunking.py
+    rag.py
+    ai_provider.py
+    autogen_orchestration.py
+    interview.py
+  tests/
+    test_backend.py
+    test_llm_workflow.py
+  uploads/                  # ignored local uploads
 ```
 
-`backend/.gitignore` excludes `venv/`, caches, uploads, Chroma runtime data, and
-`.env`. The root `.venv/` is also ignored by the local environment tooling; it is
-not required by this application. The project environment is `backend/venv/`.
+## Remaining Limitations
 
-## Future Work (Weeks 5-6)
-
-- Integrate and configure a real LLM provider through environment variables.
-- Replace the local provider with an LLM-backed question and evaluation provider.
-- Add persistent session storage and authentication.
-- Add richer document formats and better extraction quality.
-- Build the frontend and connect it to these APIs.
+- Sessions are in memory and are not authenticated or persistent.
+- Document extraction currently targets PDFs.
+- The frontend is not implemented.
+- AutoGen is currently exposed through the existing synchronous provider interface. Its `run_async` path is available for async callers; synchronous FastAPI routes use the boundary adapter without nesting an event loop.
+- AutoGen and OpenAI providers require an API key and installed external packages; tests mock those calls.
