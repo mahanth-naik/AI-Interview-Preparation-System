@@ -91,14 +91,31 @@ def test_interview_service_retrieves_context_for_question_and_evaluation(monkeyp
             assert "candidate context" in context
             return EvaluationResult(**valid_evaluation())
 
-    monkeypatch.setattr(interview, "retrieve_context", lambda query, n_results: [{"text": "candidate context"}])
+    retrieval_calls = []
+
+    def fake_retrieve_context(query, n_results, **filters):
+        retrieval_calls.append(filters)
+        return [{"text": "candidate context"}]
+
+    monkeypatch.setattr(interview, "retrieve_context", fake_retrieve_context)
     service = interview.InterviewService()
     service.provider = FakeProvider()
-    session = service.start("Python Developer", "technical", "medium", 2)
+    session = service.start(
+        "Python Developer",
+        "technical",
+        "medium",
+        2,
+        document_id="document-1",
+        user_id="user-1",
+    )
     question = service.next_question(session.session_id)
     result = service.evaluate(session.session_id, question["question"], "A detailed answer")
     assert result["technical_correctness"] == 8
     assert result["next_question_available"] is True
+    assert retrieval_calls == [
+        {"document_id": "document-1", "user_id": "user-1"},
+        {"document_id": "document-1", "user_id": "user-1"},
+    ]
 
 
 def test_autogen_provider_uses_interviewer_and_evaluator_roles():

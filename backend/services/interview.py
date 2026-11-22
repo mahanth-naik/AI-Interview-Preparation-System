@@ -94,28 +94,20 @@ class InterviewService:
         session: InterviewSession,
         query: str
     ) -> list[dict]:
-
-        # Use document-specific retrieval when a document ID is provided.
-        # Keep the original two-argument call for existing sessions/tests.
-        if session.user_id and session.document_id:
-            return retrieve_context(
-                query,
-                3,
-                document_id=session.document_id,
-                user_id=session.user_id,
-            )
-
-        if session.user_id:
+        if (
+            not isinstance(session.user_id, str)
+            or not session.user_id.strip()
+            or not isinstance(session.document_id, str)
+            or not session.document_id.strip()
+        ):
             return []
 
-        if session.document_id:
-            return retrieve_context(
-                query,
-                3,
-                document_id=session.document_id,
-            )
-
-        return retrieve_context(query, 3)
+        return retrieve_context(
+            query,
+            3,
+            document_id=session.document_id,
+            user_id=session.user_id,
+        )
 
     def next_question(
         self, session_id: str, user_id: str | None = None

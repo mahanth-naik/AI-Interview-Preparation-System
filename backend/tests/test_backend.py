@@ -22,17 +22,23 @@ def test_chunking_has_expected_overlap_and_validation():
 
 
 def test_retrieval_returns_text_metadata_and_distance(monkeypatch):
-    monkeypatch.setattr(
-        rag,
-        "search_chunks",
-        lambda query, n_results: {
+    captured = {}
+
+    def fake_search_chunks(query, n_results, **filters):
+        captured.update(query=query, n_results=n_results, filters=filters)
+        return {
             "documents": [["FastAPI experience"]],
             "metadatas": [[{"filename": "resume.pdf", "chunk_index": 0}]],
             "distances": [[0.2]],
-        },
+        }
+
+    monkeypatch.setattr(
+        rag,
+        "search_chunks",
+        fake_search_chunks,
     )
 
-    results = rag.retrieve_context("FastAPI", 1)
+    results = rag.retrieve_context("FastAPI", 1, user_id="user-1")
 
     assert results == [
         {
@@ -44,6 +50,11 @@ def test_retrieval_returns_text_metadata_and_distance(monkeypatch):
             "distance": 0.2,
         }
     ]
+    assert captured == {
+        "query": "FastAPI",
+        "n_results": 1,
+        "filters": {"user_id": "user-1"},
+    }
 
 
 def test_empty_vector_collection_returns_empty_results(monkeypatch):

@@ -6,6 +6,7 @@ import pytest
 from database import vector_store
 from database.document_store import SQLiteDocumentStore
 from database.session_store import SQLiteSessionStore
+from services import interview, rag
 
 
 def test_legacy_sessions_are_preserved_but_unowned(tmp_path):
@@ -97,6 +98,108 @@ def test_vector_search_combines_document_and_owner_filters(monkeypatch):
     assert collection.arguments["where"] == {
         "$and": [{"document_id": "resume-1"}, {"user_id": "user-1"}]
     }
+
+
+def test_vector_search_without_owner_fails_closed(monkeypatch):
+    class Collection:
+        def __init__(self):
+            self.called = False
+
+        def count(self):
+            self.called = True
+            return 1
+
+        def query(self, **kwargs):
+            self.called = True
+            raise AssertionError("unscoped vector query must not run")
+
+    collection = Collection()
+    monkeypatch.setattr(vector_store, "collection", collection)
+
+    assert vector_store.search_chunks("query") == {
+        "documents": [[]],
+        "metadatas": [[]],
+        "distances": [[]],
+    }
+    assert collection.called is False
+
+
+def test_rag_retrieval_without_owner_fails_closed(monkeypatch):
+    def unexpected_search(*args, **kwargs):
+        pytest.fail("search_chunks must not run without an owner")
+
+    monkeypatch.setattr(rag, "search_chunks", unexpected_search)
+
+    assert rag.retrieve_context("query") == []
+
+
+@pytest.mark.parametrize(
+    ("user_id", "document_id"),
+    [
+        (None, "document-1"),
+        ("user-1", None),
+        ("", "document-1"),
+        ("user-1", " "),
+    ],
+)
+def test_interview_retrieval_requires_owner_and_document(
+    tmp_path,
+    monkeypatch,
+    user_id,
+    document_id,
+):
+    def unexpected_retrieval(*args, **kwargs):
+        pytest.fail("interview retrieval must require owner and document")
+
+    monkeypatch.setattr(interview, "retrieve_context", unexpected_retrieval)
+    service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / "interview.sqlite3")
+    )
+    session = service.start(
+        "Engineer",
+        "technical",
+        "medium",
+        1,
+        document_id=document_id,
+        user_id=user_id,
+    )
+
+    assert service._retrieve_session_context(session, "query") == []
+
+
+def test_interview_retrieval_passes_owner_and_selected_document(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+
+    def fake_retrieve_context(query, n_results, **filters):
+        calls.append((query, n_results, filters))
+        return [{"text": "selected document chunk"}]
+
+    monkeypatch.setattr(interview, "retrieve_context", fake_retrieve_context)
+    service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / "interview.sqlite3")
+    )
+    session = service.start(
+        "Engineer",
+        "technical",
+        "medium",
+        1,
+        document_id="document-1",
+        user_id="user-1",
+    )
+
+    assert service._retrieve_session_context(session, "query") == [
+        {"text": "selected document chunk"}
+    ]
+    assert calls == [
+        (
+            "query",
+            3,
+            {"document_id": "document-1", "user_id": "user-1"},
+        )
+    ]
 
 
 @pytest.mark.parametrize("document_type", ["resume", "study_material"])

@@ -18,21 +18,21 @@ def retrieve_context(
     if n_results < 1 or n_results > 20:
         raise ValueError("n_results must be between 1 and 20")
 
-    if (
-        document_id is None
-        and user_id is None
-        and document_type is None
+    if not isinstance(user_id, str) or not user_id.strip():
+        return []
+
+    if document_id is not None and (
+        not isinstance(document_id, str) or not document_id.strip()
     ):
-        results = search_chunks(query, n_results)
-    else:
-        filters = {}
-        if document_id is not None:
-            filters["document_id"] = document_id
-        if user_id is not None:
-            filters["user_id"] = user_id
-        if document_type is not None:
-            filters["document_type"] = document_type
-        results = search_chunks(query, n_results, **filters)
+        return []
+
+    filters = {"user_id": user_id}
+    if document_id is not None:
+        filters["document_id"] = document_id
+    if document_type is not None:
+        filters["document_type"] = document_type
+
+    results = search_chunks(query, n_results, **filters)
 
     documents = results.get("documents", [[]])[0]
     metadatas = results.get("metadatas", [[]])[0]

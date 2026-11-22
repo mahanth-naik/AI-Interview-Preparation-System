@@ -12,6 +12,14 @@ collection = client.get_or_create_collection(
 )
 
 
+def _empty_search_results() -> dict:
+    return {
+        "documents": [[]],
+        "metadatas": [[]],
+        "distances": [[]],
+    }
+
+
 def add_chunks(
     chunks: list[str],
     filename: str,
@@ -72,20 +80,23 @@ def search_chunks(
     user_id: str | None = None,
     document_type: str | None = None,
 ):
+    if not isinstance(user_id, str) or not user_id.strip():
+        return _empty_search_results()
+
+    if document_id is not None and (
+        not isinstance(document_id, str) or not document_id.strip()
+    ):
+        return _empty_search_results()
+
     total_chunks = collection.count()
 
     if total_chunks == 0:
-        return {
-            "documents": [[]],
-            "metadatas": [[]],
-            "distances": [[]]
-        }
+        return _empty_search_results()
 
     filters = []
     if document_id is not None:
         filters.append({"document_id": document_id})
-    if user_id is not None:
-        filters.append({"user_id": user_id})
+    filters.append({"user_id": user_id})
     if document_type is not None:
         filters.append({"document_type": document_type})
     where = (
