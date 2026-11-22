@@ -2,13 +2,24 @@
 import os
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Depends,
+    Response,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-from database.vector_store import add_chunks
+from database.vector_store import add_chunks, delete_document_chunks
 from auth import get_current_user, router as auth_router
 from services.chunking import chunk_text
 from services.rag import build_context, retrieve_context
@@ -40,14 +51,27 @@ app.add_middleware(
 
 interview_service = InterviewService()
 document_store = SQLiteDocumentStore()
+MAX_DOCUMENT_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024
 
 
-def _require_owned_document(document_id: str, user_id: str) -> None:
-    if document_store.get_for_user(document_id, user_id) is None:
+def _require_owned_document(document_id: str, user_id: str) -> dict:
+    document = document_store.get_for_user(document_id, user_id)
+    if document is None:
         raise HTTPException(
             status_code=404,
             detail="Document not found",
         )
+    return document
+
+
+def _public_document(document: dict) -> dict:
+    return {
+        "document_id": document["document_id"],
+        "filename": document["filename"],
+        "document_type": document["document_type"],
+        "processing_status": document["processing_status"],
+        "created_at": document["created_at"],
+    }
 
 
 # Request models
@@ -88,6 +112,9 @@ def health_check():
 @app.post("/documents/upload")
 async def upload_document(
     file: UploadFile = File(...),
+    document_type: Literal["resume", "study_material"] = Form(
+        default="resume"
+    ),
     current_user: dict = Depends(get_current_user),
 ):
 
@@ -99,13 +126,35 @@ async def upload_document(
 
     filename = Path(file.filename).name
 
-    content = await file.read()
+    content = await file.read(MAX_DOCUMENT_UPLOAD_SIZE_BYTES + 1)
+
+    if len(content) > MAX_DOCUMENT_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="PDF exceeds the 20 MiB upload limit",
+        )
 
     if not content:
         raise HTTPException(
             status_code=400,
             detail="Uploaded PDF is empty"
         )
+
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is not a valid PDF",
+        )
+
+    user_id = current_user["user_id"]
+    document_id = uuid4().hex
+    document_store.register(
+        document_id,
+        user_id,
+        filename,
+        document_type=document_type,
+        processing_status="processing",
+    )
 
     try:
         reader = PdfReader(BytesIO(content))
@@ -117,12 +166,22 @@ async def upload_document(
                 text += page_text + "\n"
 
     except Exception as exc:
+        document_store.set_processing_status(
+            document_id,
+            user_id,
+            "failed",
+        )
         raise HTTPException(
             status_code=400,
             detail="Unable to read the uploaded PDF"
         ) from exc
 
     if not text.strip():
+        document_store.set_processing_status(
+            document_id,
+            user_id,
+            "failed",
+        )
         raise HTTPException(
             status_code=400,
             detail="No extractable text found in the PDF"
@@ -131,27 +190,63 @@ async def upload_document(
     chunks = chunk_text(text)
 
     if not chunks:
+        document_store.set_processing_status(
+            document_id,
+            user_id,
+            "failed",
+        )
         raise HTTPException(
             status_code=400,
             detail="Unable to create text chunks from the PDF"
         )
 
-    user_id = current_user["user_id"]
-    storage_result = add_chunks(chunks, filename, user_id=user_id)
-    document_store.register(
-        storage_result["document_id"],
-        user_id,
-        filename,
-    )
+    processing_complete = False
+    try:
+        storage_result = add_chunks(
+            chunks,
+            filename,
+            user_id=user_id,
+            document_type=document_type,
+            document_id=document_id,
+        )
+        document_store.set_processing_status(
+            document_id,
+            user_id,
+            "ready",
+        )
+        processing_complete = True
+    finally:
+        if not processing_complete:
+            document_store.set_processing_status(
+                document_id,
+                user_id,
+                "failed",
+            )
 
     return {
         "filename": filename,
-        "document_id": storage_result["document_id"],
+        "document_id": document_id,
+        "document_type": document_type,
+        "processing_status": "ready",
         "pages": len(reader.pages),
         "characters_extracted": len(text),
         "chunks_created": len(chunks),
         "chunks_stored": storage_result["chunks_stored"],
         "message": "PDF uploaded, text extracted, chunked, and stored successfully"
+    }
+
+
+@app.get("/documents")
+def list_documents(
+    current_user: dict = Depends(get_current_user),
+):
+    return {
+        "documents": [
+            _public_document(document)
+            for document in document_store.list_for_user(
+                current_user["user_id"]
+            )
+        ]
     }
 
 
@@ -162,6 +257,7 @@ def search_documents(
     query: str = Query(min_length=1),
     n_results: int = Query(default=3, ge=1, le=20),
     document_id: str | None = None,
+    document_type: Literal["resume", "study_material"] | None = None,
     current_user: dict = Depends(get_current_user),
 ):
     if document_id is not None:
@@ -173,6 +269,7 @@ def search_documents(
             n_results,
             document_id=document_id,
             user_id=current_user["user_id"],
+            document_type=document_type,
         )
 
     except ValueError as exc:
@@ -195,6 +292,7 @@ def ask_question(
     query: str = Query(min_length=1),
     n_results: int = Query(default=3, ge=1, le=20),
     document_id: str | None = None,
+    document_type: Literal["resume", "study_material"] | None = None,
     current_user: dict = Depends(get_current_user),
 ):
     if document_id is not None:
@@ -206,6 +304,7 @@ def ask_question(
             n_results,
             document_id=document_id,
             user_id=current_user["user_id"],
+            document_type=document_type,
         )
 
     except ValueError as exc:
@@ -224,6 +323,33 @@ def ask_question(
     }
 
 
+@app.get("/documents/{document_id}")
+def get_document(
+    document_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    document = document_store.get_for_user(
+        document_id,
+        current_user["user_id"],
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return _public_document(document)
+
+
+@app.delete("/documents/{document_id}", status_code=204)
+def delete_document(
+    document_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["user_id"]
+    _require_owned_document(document_id, user_id)
+    delete_document_chunks(document_id, user_id)
+    if not document_store.delete_for_user(document_id, user_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    return Response(status_code=204)
+
+
 # Interview routes
 
 @app.post("/interview/start")
@@ -232,7 +358,15 @@ def start_interview(
     current_user: dict = Depends(get_current_user),
 ):
     if request.document_id is not None:
-        _require_owned_document(request.document_id, current_user["user_id"])
+        document = _require_owned_document(
+            request.document_id,
+            current_user["user_id"],
+        )
+        if document["processing_status"] != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail="Document is not ready for interview use",
+            )
 
     try:
         session = interview_service.start(

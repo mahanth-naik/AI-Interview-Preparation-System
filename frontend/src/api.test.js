@@ -86,7 +86,48 @@ test("uploadResume sends the PDF as multipart form data", async () => {
 
   assert.equal(requestOptions.method, "POST");
   assert.equal(requestOptions.body.get("file").name, "resume.pdf");
+  assert.equal(requestOptions.body.get("document_type"), "resume");
   assert.equal(result.document_id, "resume-2");
+});
+
+test("study material uploads include their document type", async () => {
+  let requestOptions;
+  globalThis.fetch = async (_url, options) => {
+    requestOptions = options;
+    return Response.json({ document_id: "study-1" });
+  };
+  const file = new File(["notes"], "lecture-notes.pdf", {
+    type: "application/pdf",
+  });
+
+  const result = await api.uploadDocument(file, "study_material");
+
+  assert.equal(requestOptions.body.get("file").name, "lecture-notes.pdf");
+  assert.equal(requestOptions.body.get("document_type"), "study_material");
+  assert.equal(result.document_id, "study-1");
+});
+
+test("document management methods call the owner-scoped API routes", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return options.method === "DELETE"
+      ? new Response(null, { status: 204 })
+      : Response.json({ documents: [] });
+  };
+
+  await api.listDocuments();
+  await api.getDocument("doc / 1");
+  await api.deleteDocument("doc / 1");
+
+  assert.deepEqual(
+    calls.map(({ url, options }) => [url, options.method || "GET"]),
+    [
+      ["http://127.0.0.1:8000/documents", "GET"],
+      ["http://127.0.0.1:8000/documents/doc%20%2F%201", "GET"],
+      ["http://127.0.0.1:8000/documents/doc%20%2F%201", "DELETE"],
+    ],
+  );
 });
 
 test("authenticated API requests attach the bearer token", async () => {

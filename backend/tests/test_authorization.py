@@ -33,6 +33,9 @@ def test_interview_routes_require_authentication():
         ),
         client.get("/interviews"),
         client.get("/documents/search", params={"query": "resume"}),
+        client.get("/documents"),
+        client.get("/documents/private-document"),
+        client.delete("/documents/private-document"),
         client.get("/ask", params={"query": "resume"}),
         client.post(
             "/interview/start",
@@ -127,6 +130,7 @@ def test_resume_search_and_interview_creation_check_document_owner(
     assert searched[-1] == {
         "document_id": document_id,
         "user_id": current_user["user_id"],
+        "document_type": None,
     }
 
     second_user_headers = _create_second_user(authenticated_client)
@@ -159,7 +163,6 @@ def test_resume_search_and_interview_creation_check_document_owner(
 def test_resume_upload_records_owner_and_adds_owner_to_vector_metadata(
     authenticated_client, monkeypatch
 ):
-    document_id = "uploaded-document-id"
     captured = {}
 
     class Page:
@@ -169,10 +172,18 @@ def test_resume_upload_records_owner_and_adds_owner_to_vector_metadata(
     class Reader:
         pages = [Page()]
 
-    def fake_add_chunks(chunks, filename, user_id=None):
+    def fake_add_chunks(
+        chunks,
+        filename,
+        user_id=None,
+        document_type="resume",
+        document_id=None,
+    ):
         captured["chunks"] = chunks
         captured["filename"] = filename
         captured["user_id"] = user_id
+        captured["document_type"] = document_type
+        captured["document_id"] = document_id
         return {"document_id": document_id, "chunks_stored": len(chunks)}
 
     monkeypatch.setattr(main, "add_chunks", fake_add_chunks)
@@ -180,12 +191,23 @@ def test_resume_upload_records_owner_and_adds_owner_to_vector_metadata(
 
     response = authenticated_client.post(
         "/documents/upload",
-        files={"file": ("resume.pdf", b"fake pdf", "application/pdf")},
+        files={
+            "file": (
+                "resume.pdf",
+                b"%PDF-1.7\nfake pdf",
+                "application/pdf",
+            )
+        },
     )
     user_id = authenticated_client.get("/auth/me").json()["user"]["user_id"]
     assert response.status_code == 200
-    assert response.json()["document_id"] == document_id
+    document_id = response.json()["document_id"]
     assert captured["filename"] == "resume.pdf"
     assert captured["user_id"] == user_id
+    assert captured["document_type"] == "resume"
+    assert captured["document_id"] == document_id
     assert captured["chunks"]
-    assert main.document_store.get_for_user(document_id, user_id) is not None
+    stored = main.document_store.get_for_user(document_id, user_id)
+    assert stored is not None
+    assert stored["document_type"] == "resume"
+    assert stored["processing_status"] == "ready"

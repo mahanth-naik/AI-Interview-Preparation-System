@@ -13,12 +13,16 @@ collection = client.get_or_create_collection(
 
 
 def add_chunks(
-    chunks: list[str], filename: str, user_id: str | None = None
+    chunks: list[str],
+    filename: str,
+    user_id: str | None = None,
+    document_type: str = "resume",
+    document_id: str | None = None,
 ):
     if not chunks:
         return 0
 
-    document_id = uuid4().hex
+    document_id = document_id or uuid4().hex
 
     ids = [
         f"{document_id}_{i}"
@@ -29,6 +33,7 @@ def add_chunks(
         {
             "filename": filename,
             "document_id": document_id,
+            "document_type": document_type,
             "chunk_index": i
         }
         for i in range(len(chunks))
@@ -49,11 +54,23 @@ def add_chunks(
     }
 
 
+def delete_document_chunks(document_id: str, user_id: str) -> None:
+    collection.delete(
+        where={
+            "$and": [
+                {"document_id": document_id},
+                {"user_id": user_id},
+            ]
+        }
+    )
+
+
 def search_chunks(
     query: str,
     n_results: int = 3,
     document_id: str | None = None,
     user_id: str | None = None,
+    document_type: str | None = None,
 ):
     total_chunks = collection.count()
 
@@ -65,10 +82,12 @@ def search_chunks(
         }
 
     filters = []
-    if document_id:
+    if document_id is not None:
         filters.append({"document_id": document_id})
-    if user_id:
+    if user_id is not None:
         filters.append({"user_id": user_id})
+    if document_type is not None:
+        filters.append({"document_type": document_type})
     where = (
         {"$and": filters}
         if len(filters) > 1

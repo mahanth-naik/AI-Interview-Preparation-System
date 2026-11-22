@@ -15,8 +15,9 @@ function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authMode, setAuthMode] = useState("login");
   const [form, setForm] = useState(initialForm);
-  const [resumeName, setResumeName] = useState("");
   const [documentId, setDocumentId] = useState("");
+  const [documentType, setDocumentType] = useState("resume");
+  const [documents, setDocuments] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [session, setSession] = useState(null);
   const [question, setQuestion] = useState(null);
@@ -29,6 +30,11 @@ function App() {
   const refreshSessions = useCallback(async () => {
     const result = await api.listSessions();
     setSessions(result.sessions);
+  }, []);
+
+  const refreshDocuments = useCallback(async () => {
+    const result = await api.listDocuments();
+    setDocuments(result.documents);
   }, []);
 
   useEffect(() => {
@@ -60,10 +66,12 @@ function App() {
   useEffect(() => {
     if (user) {
       refreshSessions().catch((requestError) => setError(requestError.message));
+      refreshDocuments().catch((requestError) => setError(requestError.message));
     } else {
       setSessions([]);
+      setDocuments([]);
     }
-  }, [refreshSessions, user]);
+  }, [refreshDocuments, refreshSessions, user]);
 
   useEffect(() => {
     function handleExpiredToken() {
@@ -120,7 +128,7 @@ function App() {
       setEvaluation(null);
       setReport(null);
       setDocumentId("");
-      setResumeName("");
+      setDocuments([]);
       setPage("dashboard");
       setAuthMode("login");
       setLoading(false);
@@ -132,15 +140,31 @@ function App() {
     setForm((current) => ({ ...current, [name]: value }));
   }
 
-  async function uploadResume(event) {
+  async function uploadDocument(event) {
     const file = event.target.files?.[0];
     if (!file) return;
     setLoading(true);
     setError("");
     try {
-      const result = await api.uploadResume(file);
-      setResumeName(result.filename);
+      const result = await api.uploadDocument(file, documentType);
       setDocumentId(result.document_id);
+      await refreshDocuments();
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setLoading(false);
+      event.target.value = "";
+    }
+  }
+
+  async function deleteDocument(documentIdToDelete) {
+    if (!documentIdToDelete) return;
+    setLoading(true);
+    setError("");
+    try {
+      await api.deleteDocument(documentIdToDelete);
+      if (documentId === documentIdToDelete) setDocumentId("");
+      await refreshDocuments();
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -304,15 +328,19 @@ function App() {
           <Dashboard
             form={form}
             updateForm={updateForm}
-            uploadResume={uploadResume}
-            resumeName={resumeName}
+            uploadDocument={uploadDocument}
+            documentType={documentType}
+            setDocumentType={setDocumentType}
+            documents={documents}
             documentId={documentId}
+            setDocumentId={setDocumentId}
             loading={loading}
             sessions={sessions}
             user={user}
             onStart={startInterview}
             onResume={resumeInterview}
             onHistory={() => navigate("history")}
+            onDeleteDocument={deleteDocument}
           />
         )}
         {page === "history" && (
@@ -445,8 +473,9 @@ function AuthPage({ mode, onModeChange, onSubmit, loading, error }) {
 }
 
 function Dashboard({
-  form, updateForm, uploadResume, resumeName, documentId, loading,
-  sessions = [], user, onStart, onResume, onHistory,
+  form, updateForm, uploadDocument, documentType, setDocumentType,
+  documents = [], documentId, setDocumentId, loading, sessions = [], user,
+  onStart, onResume, onHistory, onDeleteDocument,
 }) {
   const completedSessions = sessions.filter((item) => item.status === "completed");
   const scoredSessions = completedSessions.filter(
@@ -529,16 +558,32 @@ function Dashboard({
               <div><h3>Interview setup</h3><p>Choose your role and preferred interview format.</p></div>
             </div>
 
+            <label className="dashboard-field field-full">
+              <span>Document type</span>
+              <select
+                value={documentType}
+                onChange={(event) => setDocumentType(event.target.value)}
+              >
+                <option value="resume">Resume</option>
+                <option value="study_material">Study material</option>
+              </select>
+            </label>
             <label className="resume-dropzone">
               <span className="resume-icon" aria-hidden="true">↑</span>
               <span className="resume-copy">
-                <strong>{resumeName || "Add your resume"}</strong>
-                <small>{resumeName ? "PDF selected · Ready to use" : "Upload a PDF to personalise your questions"}</small>
+                <strong>
+                  {documentType === "resume" ? "Add a resume" : "Add study material"}
+                </strong>
+                <small>Upload a PDF to use it as interview context</small>
               </span>
-              <span className="resume-action">{resumeName ? "Change file" : "Choose PDF"}</span>
-              <input type="file" accept="application/pdf,.pdf" onChange={uploadResume} disabled={loading} />
+              <span className="resume-action">Choose PDF</span>
+              <input
+                type="file"
+                accept="application/pdf,.pdf"
+                onChange={uploadDocument}
+                disabled={loading}
+              />
             </label>
-            {documentId && <p className="resume-success">✓ Resume uploaded successfully and linked to this session.</p>}
 
             <div className="dashboard-form-grid">
               <label className="dashboard-field field-full">
@@ -572,10 +617,51 @@ function Dashboard({
             <button className="dashboard-start-button" type="submit" disabled={loading}>
               {loading ? <><span className="dashboard-spinner" /> Preparing your interview…</> : <>Start interview <span aria-hidden="true">→</span></>}
             </button>
-            <p className="setup-footnote">Your resume is only used to add relevant context to your practice questions.</p>
+            <p className="setup-footnote">Only the selected document is used to add context to your practice questions.</p>
           </form>
 
           <aside className="dashboard-aside">
+            <section className="dashboard-panel recent-panel">
+              <div className="aside-heading">
+                <div><span className="section-kicker">DOCUMENT LIBRARY</span><h3>Your documents</h3></div>
+              </div>
+              {documents.length === 0 ? (
+                <div className="recent-empty">
+                  <strong>No documents uploaded yet</strong>
+                  <p>Upload a resume or study material to use it as interview context.</p>
+                </div>
+              ) : (
+                <>
+                  <label className="dashboard-field">
+                    <span>Choose context for this interview</span>
+                    <select
+                      value={documentId}
+                      onChange={(event) => setDocumentId(event.target.value)}
+                    >
+                      <option value="">No document selected</option>
+                      {documents.map((document) => (
+                        <option
+                          key={document.document_id}
+                          value={document.document_id}
+                          disabled={document.processing_status !== "ready"}
+                        >
+                          {document.filename} · {document.document_type === "resume" ? "Resume" : "Study material"} · {document.processing_status}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    onClick={() => onDeleteDocument(documentId)}
+                    disabled={loading || !documentId}
+                  >
+                    Delete selected document
+                  </button>
+                </>
+              )}
+            </section>
+
             <section className="dashboard-panel recent-panel">
               <div className="aside-heading">
                 <div><span className="section-kicker">CONTINUE PRACTISING</span><h3>Recent interviews</h3></div>

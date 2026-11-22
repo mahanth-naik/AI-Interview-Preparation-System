@@ -60,6 +60,16 @@ function postJson(path, body) {
   });
 }
 
+function uploadDocument(file, document_type = "resume") {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("document_type", document_type);
+  return request("/documents/upload", {
+    method: "POST",
+    body: formData,
+  });
+}
+
 export const api = {
   getAccessToken,
   setAccessToken,
@@ -86,12 +96,23 @@ export const api = {
     }
   },
 
+  uploadDocument,
+
   uploadResume(file) {
-    const formData = new FormData();
-    formData.append("file", file);
-    return request("/documents/upload", {
-      method: "POST",
-      body: formData,
+    return uploadDocument(file, "resume");
+  },
+
+  listDocuments() {
+    return request("/documents");
+  },
+
+  getDocument(document_id) {
+    return request(`/documents/${encodeURIComponent(document_id)}`);
+  },
+
+  deleteDocument(document_id) {
+    return request(`/documents/${encodeURIComponent(document_id)}`, {
+      method: "DELETE",
     });
   },
 

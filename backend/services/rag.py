@@ -7,6 +7,7 @@ def retrieve_context(
     n_results: int = 3,
     document_id: str | None = None,
     user_id: str | None = None,
+    document_type: str | None = None,
 ) -> list[dict]:
 
     query = query.strip()
@@ -17,7 +18,11 @@ def retrieve_context(
     if n_results < 1 or n_results > 20:
         raise ValueError("n_results must be between 1 and 20")
 
-    if document_id is None and user_id is None:
+    if (
+        document_id is None
+        and user_id is None
+        and document_type is None
+    ):
         results = search_chunks(query, n_results)
     else:
         filters = {}
@@ -25,6 +30,8 @@ def retrieve_context(
             filters["document_id"] = document_id
         if user_id is not None:
             filters["user_id"] = user_id
+        if document_type is not None:
+            filters["document_type"] = document_type
         results = search_chunks(query, n_results, **filters)
 
     documents = results.get("documents", [[]])[0]

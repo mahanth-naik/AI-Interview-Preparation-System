@@ -106,7 +106,7 @@ class InterviewService:
             )
 
         if session.user_id:
-            return retrieve_context(query, 3, user_id=session.user_id)
+            return []
 
         if session.document_id:
             return retrieve_context(

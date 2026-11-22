@@ -1,7 +1,10 @@
 import json
 import sqlite3
 
+import pytest
+
 from database import vector_store
+from database.document_store import SQLiteDocumentStore
 from database.session_store import SQLiteSessionStore
 
 
@@ -96,7 +99,11 @@ def test_vector_search_combines_document_and_owner_filters(monkeypatch):
     }
 
 
-def test_new_vector_chunks_include_owner_metadata(monkeypatch):
+@pytest.mark.parametrize("document_type", ["resume", "study_material"])
+def test_new_vector_chunks_include_owner_metadata(
+    monkeypatch,
+    document_type,
+):
     class Collection:
         def add(self, **kwargs):
             self.arguments = kwargs
@@ -108,7 +115,90 @@ def test_new_vector_chunks_include_owner_metadata(monkeypatch):
         ["candidate experience"],
         "resume.pdf",
         user_id="user-1",
+        document_type=document_type,
     )
 
     assert result["chunks_stored"] == 1
     assert collection.arguments["metadatas"][0]["user_id"] == "user-1"
+    assert (
+        collection.arguments["metadatas"][0]["document_type"]
+        == document_type
+    )
+
+
+def test_legacy_documents_migrate_to_resume_and_ready(tmp_path):
+    database_path = tmp_path / "legacy-documents.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE documents (
+                document_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents (document_id, user_id, filename)
+            VALUES ('legacy-document', 'user-1', 'resume.pdf')
+            """
+        )
+
+    document = SQLiteDocumentStore(database_path).get_for_user(
+        "legacy-document",
+        "user-1",
+    )
+
+    assert document is not None
+    assert document["document_type"] == "resume"
+    assert document["processing_status"] == "ready"
+
+
+def test_vector_search_filters_by_owner_and_document_type(monkeypatch):
+    class Collection:
+        def count(self):
+            return 1
+
+        def query(self, **kwargs):
+            self.arguments = kwargs
+            return {
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+            }
+
+    collection = Collection()
+    monkeypatch.setattr(vector_store, "collection", collection)
+
+    vector_store.search_chunks(
+        "operating systems",
+        user_id="user-1",
+        document_type="study_material",
+    )
+
+    assert collection.arguments["where"] == {
+        "$and": [
+            {"user_id": "user-1"},
+            {"document_type": "study_material"},
+        ]
+    }
+
+
+def test_vector_document_deletion_requires_owner_filter(monkeypatch):
+    class Collection:
+        def delete(self, **kwargs):
+            self.arguments = kwargs
+
+    collection = Collection()
+    monkeypatch.setattr(vector_store, "collection", collection)
+
+    vector_store.delete_document_chunks("doc-1", "user-1")
+
+    assert collection.arguments["where"] == {
+        "$and": [
+            {"document_id": "doc-1"},
+            {"user_id": "user-1"},
+        ]
+    }
