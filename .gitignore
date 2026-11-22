@@ -1,24 +1,60 @@
 # Virtual environments
 .venv/
+venv/
+adp-linux-venv/
 backend/venv/
 
 # Environment variables / secrets
 .env
+.env.*
+!.env.example
 *.env
+*.pem
+*.key
+secrets.json
+credentials.json
+service-account*.json
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
+.mypy_cache/
+.ruff_cache/
 
 # Uploaded files
 backend/uploads/
+uploads/
 
 # ChromaDB runtime data
 backend/database/chroma/
+**/chroma/
+*.sqlite
+*.sqlite3
+*.db
+*-shm
+*-wal
+*-journal
+backend/database/interviews.sqlite3
+backend/database/interviews.sqlite3-shm
+backend/database/interviews.sqlite3-wal
+backend/database/interviews.sqlite3-journal
 
 # Test/cache files
 .pytest_cache/
 
 # IDE files
 .vscode/
+
+# Frontend
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+frontend/.env
+
+# Local backups
+*_backup.*
+*.bak
+*.backup
