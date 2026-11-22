@@ -2,7 +2,7 @@ import main
 from database import vector_store
 from services import interview
 from services.ai_provider import LocalInterviewProvider
-from services.chunking import chunk_text
+from services.chunking import chunk_pages, chunk_text
 from services import rag
 
 
@@ -21,6 +21,22 @@ def test_chunking_has_expected_overlap_and_validation():
         raise AssertionError("invalid overlap should raise ValueError")
 
 
+def test_page_chunking_preserves_page_numbers_and_stable_unique_ids():
+    pages = [(1, "abcdef"), (2, "ghijkl")]
+
+    chunks = chunk_pages(pages, chunk_size=5, overlap=1)
+
+    assert [chunk["page_number"] for chunk in chunks] == [1, 1, 2, 2]
+    assert [chunk["chunk_id"] for chunk in chunks] == [
+        "chunk-000000",
+        "chunk-000001",
+        "chunk-000002",
+        "chunk-000003",
+    ]
+    assert len({chunk["chunk_id"] for chunk in chunks}) == len(chunks)
+    assert chunks == chunk_pages(pages, chunk_size=5, overlap=1)
+
+
 def test_retrieval_returns_text_metadata_and_distance(monkeypatch):
     captured = {}
 
@@ -28,8 +44,16 @@ def test_retrieval_returns_text_metadata_and_distance(monkeypatch):
         captured.update(query=query, n_results=n_results, filters=filters)
         return {
             "documents": [["FastAPI experience"]],
-            "metadatas": [[{"filename": "resume.pdf", "chunk_index": 0}]],
+            "metadatas": [[{
+                "document_id": "resume-1",
+                "filename": "resume.pdf",
+                "document_type": "resume",
+                "page_number": 3,
+                "chunk_id": "chunk-000000",
+                "chunk_index": 0,
+            }]],
             "distances": [[0.2]],
+            "ids": [["resume-1_chunk-000000"]],
         }
 
     monkeypatch.setattr(
@@ -38,13 +62,28 @@ def test_retrieval_returns_text_metadata_and_distance(monkeypatch):
         fake_search_chunks,
     )
 
-    results = rag.retrieve_context("FastAPI", 1, user_id="user-1")
+    results = rag.retrieve_context(
+        "FastAPI",
+        1,
+        document_id="resume-1",
+        user_id="user-1",
+        document_type="resume",
+    )
 
     assert results == [
         {
+            "document_id": "resume-1",
+            "filename": "resume.pdf",
+            "document_type": "resume",
+            "page_number": 3,
+            "chunk_id": "chunk-000000",
             "text": "FastAPI experience",
             "metadata": {
+                "document_id": "resume-1",
                 "filename": "resume.pdf",
+                "document_type": "resume",
+                "page_number": 3,
+                "chunk_id": "chunk-000000",
                 "chunk_index": 0,
             },
             "distance": 0.2,
@@ -53,8 +92,45 @@ def test_retrieval_returns_text_metadata_and_distance(monkeypatch):
     assert captured == {
         "query": "FastAPI",
         "n_results": 1,
-        "filters": {"user_id": "user-1"},
+        "filters": {
+            "document_id": "resume-1",
+            "user_id": "user-1",
+            "document_type": "resume",
+        },
     }
+    context = rag.build_context(results, "resume")
+    assert "source=resume.pdf" in context
+    assert "page=3" in context
+    assert "chunk=chunk-000000" in context
+    assert "FastAPI experience" in context
+
+
+def test_legacy_retrieval_uses_available_vector_id_without_inventing_page(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rag,
+        "search_chunks",
+        lambda *args, **kwargs: {
+            "documents": [["Legacy resume text"]],
+            "metadatas": [[{}]],
+            "ids": [["legacy-document_0"]],
+        },
+    )
+
+    evidence = rag.retrieve_context(
+        "experience",
+        document_id="legacy-document",
+        user_id="user-1",
+        document_type="resume",
+    )
+
+    assert evidence[0]["page_number"] is None
+    assert evidence[0]["chunk_id"] == "legacy-document_0"
+    assert evidence[0]["document_id"] is None
+    assert evidence[0]["filename"] is None
+    assert evidence[0]["document_type"] is None
+    assert evidence[0]["distance"] is None
 
 
 def test_empty_vector_collection_returns_empty_results(monkeypatch):
@@ -202,13 +278,13 @@ def test_interview_adapts_difficulty_and_generates_next_question(
             return EvaluationResult(
                 technical_correctness=8,
                 relevance=8,
-                completeness=7,
+                completeness=8,
                 clarity=8,
                 strengths=["Correct concept"],
-                weaknesses=["Could explain more"],
-                improvement_suggestions=["Add an example"],
+                weaknesses=[],
+                improvement_suggestions=[],
                 follow_up_required=False,
-                next_difficulty="hard",
+                next_difficulty="easy",
             )
 
     service = interview.InterviewService()

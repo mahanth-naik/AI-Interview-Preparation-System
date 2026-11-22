@@ -52,6 +52,8 @@ class SQLiteSessionStore:
                     current_difficulty TEXT NOT NULL,
                     target_question_count INTEGER NOT NULL,
                     active_question TEXT,
+                    question_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    question_followups_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -66,6 +68,21 @@ class SQLiteSessionStore:
             if "user_id" not in columns:
                 connection.execute(
                     "ALTER TABLE interview_sessions ADD COLUMN user_id TEXT"
+                )
+            if "question_evidence_json" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE interview_sessions
+                    ADD COLUMN question_evidence_json TEXT NOT NULL DEFAULT '[]'
+                    """
+                )
+            if "question_followups_json" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE interview_sessions
+                    ADD COLUMN question_followups_json
+                    TEXT NOT NULL DEFAULT '[]'
+                    """
                 )
             connection.execute(
                 """
@@ -84,9 +101,10 @@ class SQLiteSessionStore:
                     session_id, user_id, role, interview_type, difficulty, document_id,
                     current_question, questions_json, answers_json,
                     evaluations_json, status, current_difficulty,
-                    target_question_count, active_question
+                    target_question_count, active_question,
+                    question_evidence_json, question_followups_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     role = excluded.role,
@@ -101,6 +119,8 @@ class SQLiteSessionStore:
                     current_difficulty = excluded.current_difficulty,
                     target_question_count = excluded.target_question_count,
                     active_question = excluded.active_question,
+                    question_evidence_json = excluded.question_evidence_json,
+                    question_followups_json = excluded.question_followups_json,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -118,6 +138,8 @@ class SQLiteSessionStore:
                     values["current_difficulty"],
                     values["target_question_count"],
                     values["active_question"],
+                    json.dumps(values["question_evidence"]),
+                    json.dumps(values["question_followups"]),
                 ),
             )
 
@@ -155,6 +177,10 @@ class SQLiteSessionStore:
             "current_difficulty": row["current_difficulty"],
             "target_question_count": row["target_question_count"],
             "active_question": row["active_question"],
+            "question_evidence": json.loads(row["question_evidence_json"]),
+            "question_followups": json.loads(
+                row["question_followups_json"]
+            ),
         }
 
     def list(

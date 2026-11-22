@@ -9,6 +9,7 @@ from services.ai_provider import (
     LLMConfigurationError,
     LLMProviderError,
     _evaluation_mode_prompt,
+    _question_progression_instructions,
     _question_mode_prompt,
     _strip_json_fence,
 )
@@ -25,8 +26,7 @@ Use the supplied source context, role, interview type,
 difficulty, and interview history.
 
 Do not repeat previous questions.
-Ask an appropriate follow-up when history or the previous answer
-requires it.
+Ask a follow-up only when the task explicitly requests one.
 Follow the mode-specific source instructions in the task.
 Return only the question, without explanation or numbering.
 """
@@ -254,7 +254,7 @@ class AutoGenProvider:
 Generate exactly one {difficulty} {interview_type}
 interview question for a {role}.
 
-Do not repeat any question in the history.
+{_question_progression_instructions(history)}
 
 {context_label}:
 {context}

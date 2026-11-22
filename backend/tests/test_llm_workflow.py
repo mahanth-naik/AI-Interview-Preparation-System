@@ -191,6 +191,34 @@ def test_local_provider_questions_quote_the_selected_source():
     assert "candidate experience" not in study_question.lower()
 
 
+def test_llm_question_prompt_only_requests_explicit_follow_ups():
+    history = [
+        {
+            "question": "How did you measure latency?",
+            "answer": "I compared the p95 measurements.",
+            "_generation_metadata": {
+                "follow_up_requested": True,
+                "follow_up_reason": "Explain the measurement choice.",
+                "rejected_questions": ["Repeat the original question?"],
+            },
+        }
+    ]
+    client = FakeClient("What trade-off led you to that measurement?")
+    provider = OpenAIProvider(api_key="test-key", client=client)
+    provider.generate_question(
+        "Engineer",
+        "technical",
+        "medium",
+        history,
+        "",
+    )
+
+    prompt = client.completions.requests[-1]["messages"][1]["content"]
+    assert "distinct follow-up" in prompt
+    assert "Explain the measurement choice." in prompt
+    assert "Repeat the original question?" in prompt
+
+
 def test_local_study_evaluation_does_not_reward_unmatched_claims():
     provider = LocalInterviewProvider()
     context = build_context(
@@ -240,6 +268,24 @@ def test_autogen_provider_includes_mode_specific_source_instructions():
         context,
         context_mode="study_material",
     )
+    provider.generate_question(
+        "Network Engineer",
+        "technical",
+        "medium",
+        [
+            {
+                "question": "What does the congestion window control?",
+                "answer": "It limits unacknowledged data.",
+                "_generation_metadata": {
+                    "follow_up_requested": True,
+                    "follow_up_reason": "Clarify the reasoning.",
+                    "rejected_questions": [],
+                },
+            }
+        ],
+        context,
+        context_mode="study_material",
+    )
     provider.evaluate_answer(
         "Network Engineer",
         "What does the congestion window control?",
@@ -251,8 +297,9 @@ def test_autogen_provider_includes_mode_specific_source_instructions():
 
     assert "not candidate experience" in orchestrator.tasks[0][1]
     assert "Study-material evidence" in orchestrator.tasks[0][1]
-    assert "unsupported claims" in orchestrator.tasks[1][1]
-    assert "Study-material evidence" in orchestrator.tasks[1][1]
+    assert "distinct follow-up" in orchestrator.tasks[1][1]
+    assert "unsupported claims" in orchestrator.tasks[2][1]
+    assert "Study-material evidence" in orchestrator.tasks[2][1]
 
 
 def test_interview_service_retrieves_mode_specific_context_for_question_and_evaluation(
@@ -297,7 +344,15 @@ def test_interview_service_retrieves_mode_specific_context_for_question_and_eval
 
     def fake_retrieve_context(query, n_results, **filters):
         retrieval_calls.append((query, filters))
-        return [{"text": "Built a Python reporting service."}]
+        return [{
+            "document_id": "document-1",
+            "filename": "resume.pdf",
+            "document_type": "resume",
+            "page_number": 2,
+            "chunk_id": "chunk-000001",
+            "text": "Built a Python reporting service.",
+            "distance": 0.1,
+        }]
 
     monkeypatch.setattr(interview, "retrieve_context", fake_retrieve_context)
     provider = FakeProvider()
@@ -320,7 +375,11 @@ def test_interview_service_retrieves_mode_specific_context_for_question_and_eval
         user_id="user-1",
     )
     question = service.next_question(session.session_id)
-    result = service.evaluate(session.session_id, question["question"], "A detailed answer")
+    result = service.evaluate(
+        session.session_id,
+        question["question"],
+        "A detailed answer",
+    )
     assert result["technical_correctness"] == 8
     assert result["next_question_available"] is True
     assert "resume skills technologies projects" in retrieval_calls[0][0]
@@ -336,6 +395,9 @@ def test_interview_service_retrieves_mode_specific_context_for_question_and_eval
         for _, filters in retrieval_calls
     )
     assert provider.modes == ["resume", "resume"]
+    assert question["evidence"][0]["filename"] == "resume.pdf"
+    assert question["evidence"][0]["page_number"] == 2
+    assert result["evidence"][0]["chunk_id"] == "chunk-000001"
 
 
 def test_study_material_interview_uses_source_only_context_and_question_query(
@@ -383,10 +445,16 @@ def test_study_material_interview_uses_source_only_context_and_question_query(
         retrieval_calls.append((query, filters))
         return [
             {
+                "document_id": "study-document",
+                "filename": "networking-notes.pdf",
+                "document_type": "study_material",
+                "page_number": 6,
+                "chunk_id": "chunk-000004",
                 "text": (
                     "TCP uses a congestion window to control the amount "
                     "of unacknowledged data."
-                )
+                ),
+                "distance": 0.12,
             }
         ]
 
@@ -435,6 +503,31 @@ def test_study_material_interview_uses_source_only_context_and_question_query(
     assert provider.evaluation_context[0] == "study_material"
     assert "TCP uses a congestion window" in provider.evaluation_context[1]
     assert evaluation["technical_correctness"] == 8
+    expected_evidence = [{
+        "document_id": "study-document",
+        "filename": "networking-notes.pdf",
+        "document_type": "study_material",
+        "page_number": 6,
+        "chunk_id": "chunk-000004",
+        "text": (
+            "TCP uses a congestion window to control the amount "
+            "of unacknowledged data."
+        ),
+        "distance": 0.12,
+    }]
+    assert question["evidence"] == expected_evidence
+    assert evaluation["evidence"] == expected_evidence
+
+    resumed_service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / "study.sqlite3"),
+        provider=provider,
+    )
+    report = resumed_service.get_report(
+        session.session_id,
+        user_id="user-1",
+    )
+    assert report["question_results"][0]["question_evidence"] == expected_evidence
+    assert report["question_results"][0]["evaluation_evidence"] == expected_evidence
 
 
 @pytest.mark.parametrize("document_type", ["resume", "study_material"])

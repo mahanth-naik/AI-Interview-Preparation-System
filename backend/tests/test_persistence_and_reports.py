@@ -17,7 +17,9 @@ class FakeProvider:
         context,
         context_mode="general",
     ):
-        return f"{difficulty} question {len(history) + 1}"
+        if history:
+            return "How would you measure database throughput?"
+        return "How would you test service reliability?"
 
     def evaluate_answer(
         self,
@@ -72,14 +74,16 @@ def test_session_and_active_question_survive_service_restart(tmp_path, monkeypat
         provider=provider,
     ).next_question(session.session_id)
 
-    assert second_question["question"] == "hard question 2"
+    assert second_question["question"] == (
+        "How would you measure database throughput?"
+    )
     restored = InterviewService(
         store=SQLiteSessionStore(database_path),
         provider=provider,
     ).get(session.session_id)
     assert restored.document_id == "resume-123"
     assert restored.current_question == 1
-    assert restored.current_difficulty == "hard"
+    assert restored.current_difficulty == "medium"
     assert restored.answers[0]["question"] == first_question["question"]
     assert restored.active_question == second_question["question"]
 
@@ -108,6 +112,8 @@ def test_completed_session_produces_persisted_final_report(tmp_path, monkeypatch
     assert report["question_count"] == 1
     assert report["overall_score"] == 8
     assert report["question_results"][0]["question"] == question
+    assert report["question_results"][0]["question_evidence"] == []
+    assert report["question_results"][0]["evaluation_evidence"] == []
     assert report["strengths"] == ["Clear explanation"]
     assert report["weaknesses"] == ["Missing a metric"]
     assert report["recommendations"] == ["Add a measured result"]

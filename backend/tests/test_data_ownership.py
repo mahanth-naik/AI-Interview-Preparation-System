@@ -66,6 +66,8 @@ def test_legacy_sessions_are_preserved_but_unowned(tmp_path):
     assert legacy is not None
     assert legacy["role"] == "Engineer"
     assert legacy["user_id"] is None
+    assert legacy["question_evidence"] == []
+    assert legacy["question_followups"] == []
     assert store.get("legacy-session", user_id="new-account") is None
     assert store.list(user_id="new-account") == []
 
@@ -241,6 +243,78 @@ def test_new_vector_chunks_include_owner_metadata(
         collection.arguments["metadatas"][0]["document_type"]
         == document_type
     )
+
+
+def test_vector_provenance_metadata_survives_retrieval(monkeypatch):
+    class Collection:
+        def __init__(self):
+            self.documents = []
+            self.ids = []
+            self.metadatas = []
+
+        def add(self, documents, ids, metadatas):
+            self.documents.extend(documents)
+            self.ids.extend(ids)
+            self.metadatas.extend(metadatas)
+
+        def count(self):
+            return len(self.documents)
+
+        def query(self, **kwargs):
+            assert kwargs["where"] == {
+                "$and": [
+                    {"document_id": "study-1"},
+                    {"user_id": "user-1"},
+                    {"document_type": "study_material"},
+                ]
+            }
+            return {
+                "documents": [self.documents],
+                "metadatas": [self.metadatas],
+                "ids": [self.ids],
+                "distances": [[0.15]],
+            }
+
+    collection = Collection()
+    monkeypatch.setattr(vector_store, "collection", collection)
+
+    vector_store.add_chunks(
+        [{
+            "text": "The material defines process scheduling.",
+            "page_number": 4,
+            "chunk_id": "chunk-000012",
+        }],
+        "operating-systems.pdf",
+        user_id="user-1",
+        document_type="study_material",
+        document_id="study-1",
+    )
+    evidence = rag.retrieve_context(
+        "process scheduling",
+        document_id="study-1",
+        user_id="user-1",
+        document_type="study_material",
+    )
+
+    assert collection.metadatas == [{
+        "filename": "operating-systems.pdf",
+        "document_id": "study-1",
+        "document_type": "study_material",
+        "chunk_index": 0,
+        "chunk_id": "chunk-000012",
+        "page_number": 4,
+        "user_id": "user-1",
+    }]
+    assert evidence[0] == {
+        "document_id": "study-1",
+        "filename": "operating-systems.pdf",
+        "document_type": "study_material",
+        "page_number": 4,
+        "chunk_id": "chunk-000012",
+        "text": "The material defines process scheduling.",
+        "distance": 0.15,
+        "metadata": collection.metadatas[0],
+    }
 
 
 def test_legacy_documents_migrate_to_resume_and_ready(tmp_path):

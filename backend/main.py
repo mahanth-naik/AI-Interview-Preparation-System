@@ -21,7 +21,7 @@ from pypdf import PdfReader
 
 from database.vector_store import add_chunks, delete_document_chunks
 from auth import get_current_user, router as auth_router
-from services.chunking import chunk_text
+from services.chunking import chunk_pages
 from services.rag import build_context, retrieve_context
 from services.interview import InterviewService
 from database.document_store import SQLiteDocumentStore
@@ -158,12 +158,16 @@ async def upload_document(
 
     try:
         reader = PdfReader(BytesIO(content))
-        text = ""
+        page_texts = []
 
-        for page in reader.pages:
+        for page_number, page in enumerate(reader.pages, start=1):
             page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+            page_texts.append((page_number, page_text or ""))
+        text = "".join(
+            page_text + "\n"
+            for _, page_text in page_texts
+            if page_text
+        )
 
     except Exception as exc:
         document_store.set_processing_status(
@@ -187,7 +191,7 @@ async def upload_document(
             detail="No extractable text found in the PDF"
         )
 
-    chunks = chunk_text(text)
+    chunks = chunk_pages(page_texts)
 
     if not chunks:
         document_store.set_processing_status(

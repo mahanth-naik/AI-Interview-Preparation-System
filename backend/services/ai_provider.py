@@ -12,6 +12,43 @@ load_dotenv()
 InterviewContextMode = Literal["general", "resume", "study_material"]
 
 
+def _generation_metadata(history: list[dict]) -> dict[str, Any]:
+    for item in reversed(history):
+        metadata = item.get("_generation_metadata")
+        if isinstance(metadata, dict):
+            return metadata
+    return {}
+
+
+def _question_progression_instructions(history: list[dict]) -> str:
+    metadata = _generation_metadata(history)
+    rejected_questions = metadata.get("rejected_questions", [])
+    instructions = (
+        "Generate a new interview question, not a follow-up, unless the "
+        "generation metadata explicitly requests a follow-up."
+    )
+    if metadata.get("follow_up_requested") is True:
+        instructions = (
+            "Generate one distinct follow-up to the most recent answer. "
+            "Explore the candidate's reasoning, clarify an ambiguous point, "
+            "or ask for a missing detail. Do not repeat or merely rephrase "
+            "the previous question."
+        )
+        reason = metadata.get("follow_up_reason")
+        if isinstance(reason, str) and reason.strip():
+            instructions += f" Focus on this feedback: {reason.strip()}"
+    if isinstance(rejected_questions, list) and rejected_questions:
+        instructions += (
+            " Do not repeat or paraphrase any rejected question: "
+            + " | ".join(
+                question
+                for question in rejected_questions
+                if isinstance(question, str)
+            )
+        )
+    return instructions
+
+
 def _question_mode_prompt(
     context_mode: InterviewContextMode,
 ) -> tuple[str, str]:
@@ -166,6 +203,28 @@ class LocalInterviewProvider:
                 f"Unsupported interview context mode: {context_mode}"
             )
 
+        metadata = _generation_metadata(history)
+        if metadata.get("follow_up_requested") is True:
+            answer_entry = next(
+                (
+                    item
+                    for item in reversed(history)
+                    if isinstance(item.get("answer"), str)
+                ),
+                {},
+            )
+            answer_excerpt = " ".join(
+                (answer_entry.get("answer") or "").split()[:12]
+            ).strip("\"' .,;:")
+            answer_excerpt = answer_excerpt or "your previous answer"
+            attempt = len(metadata.get("rejected_questions", []))
+            follow_up_templates = (
+                f'You said, "{answer_excerpt}". What reasoning led you to that answer?',
+                f'Can you clarify how you arrived at "{answer_excerpt}"?',
+                f'What evidence or example supports your statement, "{answer_excerpt}"?',
+            )
+            return follow_up_templates[attempt % len(follow_up_templates)]
+
         if context_mode in {"resume", "study_material"}:
             excerpts = self._context_excerpts(context)
             if not excerpts:
@@ -173,17 +232,31 @@ class LocalInterviewProvider:
                     "No source evidence is available for this interview mode"
                 )
 
-            excerpt = excerpts[len(history) % len(excerpts)]
-            if context_mode == "resume":
-                return (
-                    f"Your resume states \"{excerpt}\". What skills or "
-                    f"experience does this statement represent for a {role} role?"
-                )
-
-            return (
-                f"For a {role} {interview_type} interview, explain the concept "
-                f"or principle described in this study passage: \"{excerpt}\""
+            answer_count = sum(
+                1 for item in history if isinstance(item.get("question"), str)
             )
+            attempt = len(metadata.get("rejected_questions", []))
+            excerpt = excerpts[(answer_count + attempt) % len(excerpts)]
+            if context_mode == "resume":
+                templates = (
+                    f"Your resume states \"{excerpt}\". What skills or "
+                    f"experience does this statement represent for a {role} role?",
+                    f"How does the resume statement \"{excerpt}\" relate to "
+                    f"the work of a {role}?",
+                    f"What specific contribution is described by this resume "
+                    f"statement: \"{excerpt}\"?",
+                )
+                return templates[attempt % len(templates)]
+
+            templates = (
+                f"For a {role} {interview_type} interview, explain the concept "
+                f"or principle described in this study passage: \"{excerpt}\"",
+                f"According to this study passage, how does the following "
+                f"concept work: \"{excerpt}\"?",
+                f"What is the significance of the idea described here: "
+                f"\"{excerpt}\"?",
+            )
+            return templates[attempt % len(templates)]
 
         questions = self.generate_questions(
             role, interview_type, difficulty, 5, context
@@ -193,7 +266,15 @@ class LocalInterviewProvider:
         previous_questions = {
             item["question"].strip().lower()
             for item in history
+            if isinstance(item.get("question"), str)
         }
+        rejected_questions = metadata.get("rejected_questions", [])
+        if isinstance(rejected_questions, list):
+            previous_questions.update(
+                question.strip().lower()
+                for question in rejected_questions
+                if isinstance(question, str)
+            )
 
         for question in questions:
             if question.strip().lower() not in previous_questions:
@@ -483,7 +564,7 @@ class OpenAIProvider:
             "You are a rigorous interviewer. " + mode_instructions,
             f"Generate exactly one {difficulty} "
             f"{interview_type} interview question for a {role}. "
-            f"Ask a relevant follow-up when history exists. "
+            f"{_question_progression_instructions(history)} "
             f"{context_label}:\n{context}\n"
             f"History:\n{history}",
         )
@@ -630,7 +711,7 @@ class GeminiProvider:
             "You are a rigorous interviewer. " + mode_instructions,
             f"Generate exactly one {difficulty} "
             f"{interview_type} interview question for a {role}. "
-            f"Ask a relevant follow-up when history exists. "
+            f"{_question_progression_instructions(history)} "
             f"{context_label}:\n{context}\n"
             f"History:\n{history}",
         )

@@ -1,16 +1,102 @@
 
 from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
+import re
 from uuid import uuid4
 
 from services.ai_provider import (
     EvaluationResult,
     InterviewContextMode,
     InterviewProvider,
+    LLMProviderError,
     get_interview_provider,
 )
 from database.document_store import SQLiteDocumentStore
 from database.session_store import SQLiteSessionStore
 from services.rag import build_context, retrieve_context
+
+
+_MAX_QUESTION_GENERATION_ATTEMPTS = 3
+_QUESTION_STOP_WORDS = {
+    "a", "an", "and", "are", "can", "describe", "does", "do", "explain",
+    "for", "how", "in", "is", "it", "of", "on", "the", "to", "what",
+    "when", "where", "which", "who", "why", "with", "would", "you", "your",
+}
+
+
+def _normalized_question(question: str) -> str:
+    words = re.findall(r"[a-z0-9]+", question.casefold())
+    normalized = []
+    for word in words:
+        if word.endswith("s") and not word.endswith("ss") and len(word) > 4:
+            word = word[:-1]
+        if word not in _QUESTION_STOP_WORDS:
+            normalized.append(word)
+    return " ".join(normalized)
+
+
+def _is_duplicate_question(question: str, previous: list[str]) -> bool:
+    candidate = _normalized_question(question)
+    if not candidate:
+        return True
+
+    candidate_words = set(candidate.split())
+    for previous_question in previous:
+        previous_normalized = _normalized_question(previous_question)
+        if not previous_normalized:
+            continue
+        if candidate == previous_normalized:
+            return True
+
+        previous_words = set(previous_normalized.split())
+        shared_words = candidate_words.intersection(previous_words)
+        smaller_size = min(len(candidate_words), len(previous_words))
+        union_size = len(candidate_words.union(previous_words))
+        if (
+            smaller_size >= 3
+            and len(shared_words) / smaller_size >= 0.8
+            and len(shared_words) / union_size >= 0.65
+        ):
+            return True
+        if SequenceMatcher(
+            None,
+            candidate,
+            previous_normalized,
+        ).ratio() >= 0.9:
+            return True
+    return False
+
+
+def _difficulty_after_evaluation(current: str, evaluation: object) -> str:
+    """Raise at score >= 8 without concerns; lower at <= 4 or <= 6 with concerns."""
+    levels = ("easy", "medium", "hard")
+    current = current.casefold() if isinstance(current, str) else "medium"
+    if current not in levels:
+        current = "medium"
+
+    score = getattr(evaluation, "score", None)
+    if not isinstance(score, (int, float)):
+        return current
+
+    weaknesses = getattr(evaluation, "weaknesses", [])
+    improvements = getattr(
+        evaluation,
+        "improvement_suggestions",
+        getattr(evaluation, "improvements", []),
+    )
+    has_concerns = any(
+        isinstance(item, str) and item.strip()
+        for items in (weaknesses, improvements)
+        if isinstance(items, list)
+        for item in items
+    )
+
+    index = levels.index(current)
+    if score <= 4 or (score <= 6 and has_concerns):
+        index = max(0, index - 1)
+    elif score >= 8 and not has_concerns:
+        index = min(len(levels) - 1, index + 1)
+    return levels[index]
 
 
 @dataclass
@@ -33,6 +119,8 @@ class InterviewSession:
 
     active_question: str | None = None
     user_id: str | None = None
+    question_evidence: list[list[dict]] = field(default_factory=list)
+    question_followups: list[bool] = field(default_factory=list)
 
 
 class InterviewService:
@@ -90,6 +178,13 @@ class InterviewService:
             self.sessions[session_id] = session
         else:
             session.__dict__.update(stored_session)
+        session.question_followups = (
+            session.question_followups
+            + [False] * max(
+                0,
+                len(session.questions) - len(session.question_followups),
+            )
+        )[:len(session.questions)]
         return session
 
     def _retrieve_session_context(
@@ -114,6 +209,22 @@ class InterviewService:
             user_id=session.user_id,
             document_type=document_type,
         )
+
+    @staticmethod
+    def _evidence_references(context_items: list[dict]) -> list[dict]:
+        fields = (
+            "document_id",
+            "filename",
+            "document_type",
+            "page_number",
+            "chunk_id",
+            "text",
+            "distance",
+        )
+        return [
+            {field: item.get(field) for field in fields}
+            for item in context_items
+        ]
 
     def _session_document_type(
         self,
@@ -141,18 +252,104 @@ class InterviewService:
     def _question_retrieval_query(
         session: InterviewSession,
         document_type: InterviewContextMode | None,
+        follow_up: bool = False,
     ) -> str:
+        previous = session.answers[-1] if session.answers else {}
+        previous_question = previous.get("question", "")
+        previous_answer = previous.get("answer", "")
+        follow_up_context = (
+            f" Follow-up to question: {previous_question}. "
+            f"Candidate answer: {previous_answer}"
+            if follow_up
+            else ""
+        )
         if document_type == "resume":
             return (
                 f"resume skills technologies projects and work experience "
                 f"relevant to {session.role} {session.interview_type}"
+                f"{follow_up_context}"
             )
         if document_type == "study_material":
             return (
                 "key concepts definitions principles processes and "
                 "explanations in the selected study material"
+                f"{follow_up_context}"
             )
-        return f"{session.role} {session.interview_type}"
+        return f"{session.role} {session.interview_type}{follow_up_context}"
+
+    @staticmethod
+    def _generation_history(
+        session: InterviewSession,
+        follow_up: bool,
+        rejected_questions: list[str],
+    ) -> list[dict]:
+        history = [dict(item) for item in session.answers]
+        if not follow_up and not rejected_questions:
+            return history
+
+        reason = ""
+        if session.evaluations:
+            evaluation = session.evaluations[-1]
+            suggestions = evaluation.get(
+                "improvement_suggestions",
+                evaluation.get("improvements", []),
+            )
+            if isinstance(suggestions, list):
+                reason = " ".join(
+                    item for item in suggestions if isinstance(item, str)
+                )
+            if not reason and isinstance(evaluation.get("feedback"), str):
+                reason = evaluation["feedback"]
+
+        metadata = {
+            "follow_up_requested": follow_up,
+            "follow_up_reason": reason,
+            "rejected_questions": list(rejected_questions),
+        }
+        if history:
+            history[-1]["_generation_metadata"] = metadata
+        else:
+            history.append({"_generation_metadata": metadata})
+        return history
+
+    def _generate_distinct_question(
+        self,
+        session: InterviewSession,
+        context: str,
+        document_type: InterviewContextMode | None,
+        follow_up: bool,
+    ) -> str:
+        rejected_questions: list[str] = []
+        for _ in range(_MAX_QUESTION_GENERATION_ATTEMPTS):
+            history = self._generation_history(
+                session,
+                follow_up,
+                rejected_questions,
+            )
+            generated = self.provider.generate_question(
+                session.role,
+                session.interview_type,
+                session.current_difficulty,
+                history,
+                context,
+                context_mode=document_type or "general",
+            )
+            if not isinstance(generated, str) or not generated.strip():
+                raise LLMProviderError(
+                    "The interview provider returned an empty question."
+                )
+            question = generated.strip()
+            if not _is_duplicate_question(
+                question,
+                [*session.questions, *rejected_questions],
+            ):
+                return question
+            rejected_questions.append(question)
+
+        raise LLMProviderError(
+            "Unable to generate a distinct interview question after "
+            f"{_MAX_QUESTION_GENERATION_ATTEMPTS} attempts."
+        )
 
     @staticmethod
     def _evaluation_retrieval_query(
@@ -197,13 +394,54 @@ class InterviewService:
                 "status": "completed"
             }
 
+        if session.current_question > len(session.questions):
+            raise ValueError("Interview question progression is inconsistent.")
+        while len(session.question_followups) < len(session.questions):
+            session.question_followups.append(False)
+
+        if (
+            session.current_question < len(session.questions)
+            and _is_duplicate_question(
+                session.questions[session.current_question],
+                session.questions[:session.current_question],
+            )
+        ):
+            session.questions = session.questions[:session.current_question]
+            session.question_evidence = session.question_evidence[
+                :session.current_question
+            ]
+            session.question_followups = session.question_followups[
+                :session.current_question
+            ]
+            session.active_question = None
+            self.store.save(session)
+
+        if (
+            session.current_question == len(session.questions)
+            and session.active_question is not None
+        ):
+            session.active_question = None
+            self.store.save(session)
+
         # Generate a question only when one does not already exist.
         if session.current_question == len(session.questions):
+            is_follow_up = bool(
+                session.evaluations
+                and session.evaluations[-1].get("follow_up_required") is True
+                and (
+                    not session.question_followups
+                    or not session.question_followups[-1]
+                )
+            )
             document_type = self._session_document_type(session)
 
             context_items = self._retrieve_session_context(
                 session,
-                self._question_retrieval_query(session, document_type),
+                self._question_retrieval_query(
+                    session,
+                    document_type,
+                    follow_up=is_follow_up,
+                ),
                 document_type,
             )
 
@@ -212,32 +450,46 @@ class InterviewService:
                     "No relevant content was found in the selected document."
                 )
 
-            context = build_context(
-                [item["text"] for item in context_items],
-                document_type,
-            )
+            context = build_context(context_items, document_type)
 
-            question = self.provider.generate_question(
-                session.role,
-                session.interview_type,
-                session.current_difficulty,
-                session.answers,
+            question = self._generate_distinct_question(
+                session,
                 context,
-                context_mode=document_type or "general",
+                document_type,
+                is_follow_up,
             )
 
+            while len(session.question_evidence) < len(session.questions):
+                session.question_evidence.append([])
             session.questions.append(question)
+            session.question_evidence.append(
+                self._evidence_references(context_items)
+            )
+            session.question_followups.append(is_follow_up)
 
         question = session.questions[session.current_question]
+        is_follow_up = (
+            session.question_followups[session.current_question]
+            if session.current_question < len(session.question_followups)
+            else False
+        )
+        evidence = (
+            session.question_evidence[session.current_question]
+            if session.current_question < len(session.question_evidence)
+            else []
+        )
 
-        session.active_question = question
+        if session.active_question != question:
+            session.active_question = question
         self.store.save(session)
 
         return {
             "question": question,
             "question_number": session.current_question + 1,
             "status": session.status,
-            "difficulty": session.current_difficulty
+            "difficulty": session.current_difficulty,
+            "evidence": evidence,
+            "is_follow_up": is_follow_up,
         }
 
     def evaluate(
@@ -295,10 +547,8 @@ class InterviewService:
                 "No relevant study-material evidence was found for this question."
             )
 
-        context = build_context(
-            [item["text"] for item in context_items],
-            document_type,
-        )
+        context = build_context(context_items, document_type)
+        evidence = self._evidence_references(context_items)
 
         # Evaluate the answer.
         evaluation = self.provider.evaluate_answer(
@@ -319,6 +569,16 @@ class InterviewService:
         result["score"] = evaluation.score
         result["feedback"] = evaluation.feedback
         result["improvements"] = evaluation.improvements
+        result["evidence"] = evidence
+        result["next_difficulty"] = _difficulty_after_evaluation(
+            session.current_difficulty,
+            evaluation,
+        )
+        current_is_follow_up = (
+            session.question_followups[session.current_question]
+            if session.current_question < len(session.question_followups)
+            else False
+        )
 
         # Update the session only after successful evaluation.
         session.answers.append({
@@ -331,8 +591,17 @@ class InterviewService:
         session.active_question = None
         session.current_question += 1
 
-        # Adapt difficulty for the next question.
-        session.current_difficulty = evaluation.next_difficulty
+        session.current_difficulty = result["next_difficulty"]
+        follow_up_requested = getattr(
+            evaluation,
+            "follow_up_required",
+            evaluation.score <= 4,
+        )
+        result["follow_up_required"] = bool(
+            follow_up_requested
+            and not current_is_follow_up
+            and session.current_question < session.target_question_count
+        )
 
         # Check whether the interview is completed.
         if session.current_question >= session.target_question_count:
@@ -406,6 +675,11 @@ class InterviewService:
                 {
                     "question_number": index + 1,
                     "question": question,
+                    "is_follow_up": (
+                        session.question_followups[index]
+                        if index < len(session.question_followups)
+                        else False
+                    ),
                     "answer": answer,
                     "score": score,
                     "technical_correctness": evaluation.get("technical_correctness"),
@@ -415,6 +689,16 @@ class InterviewService:
                     "strengths": strengths,
                     "weaknesses": weaknesses,
                     "recommendations": suggestions,
+                    "question_evidence": (
+                        session.question_evidence[index]
+                        if index < len(session.question_evidence)
+                        else []
+                    ),
+                    "evaluation_evidence": (
+                        evaluation.get("evidence", [])
+                        if isinstance(evaluation.get("evidence", []), list)
+                        else []
+                    ),
                 }
             )
 

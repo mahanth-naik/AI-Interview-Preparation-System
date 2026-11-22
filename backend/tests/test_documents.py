@@ -14,13 +14,24 @@ def _upload(client, document_type="resume", filename="document.pdf", content=Non
     )
 
 
-def _fake_pdf_reader(monkeypatch, text="Document text for retrieval."):
+def _fake_pdf_reader(
+    monkeypatch,
+    text="Document text for retrieval.",
+    page_texts=None,
+):
     class Page:
+        def __init__(self, extracted_text):
+            self.extracted_text = extracted_text
+
         def extract_text(self):
-            return text
+            return self.extracted_text
 
     class Reader:
-        pages = [Page()]
+        def __init__(self):
+            self.pages = [
+                Page(page_text)
+                for page_text in (page_texts or [text])
+            ]
 
     monkeypatch.setattr(main, "PdfReader", lambda _: Reader())
 
@@ -83,6 +94,32 @@ def test_upload_supports_resume_and_study_material(
     assert stored["document_type"] == document_type
     assert stored["processing_status"] == "ready"
     assert stored["created_at"]
+
+
+def test_upload_preserves_original_page_numbers_in_chunks(
+    authenticated_client,
+    monkeypatch,
+):
+    _fake_pdf_reader(
+        monkeypatch,
+        page_texts=["First page concepts.", "Second page concepts."],
+    )
+    captured = _fake_vector_add(monkeypatch)
+
+    response = _upload(authenticated_client, "study_material")
+
+    assert response.status_code == 200
+    assert [
+        (chunk["page_number"], chunk["text"])
+        for chunk in captured["chunks"]
+    ] == [
+        (1, "First page concepts."),
+        (2, "Second page concepts."),
+    ]
+    assert [chunk["chunk_id"] for chunk in captured["chunks"]] == [
+        "chunk-000000",
+        "chunk-000001",
+    ]
 
 
 def test_document_list_and_detail_are_scoped_to_current_user(

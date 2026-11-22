@@ -21,7 +21,7 @@ def _empty_search_results() -> dict:
 
 
 def add_chunks(
-    chunks: list[str],
+    chunks: list[str | dict[str, str | int]],
     filename: str,
     user_id: str | None = None,
     document_type: str = "resume",
@@ -32,33 +32,62 @@ def add_chunks(
 
     document_id = document_id or uuid4().hex
 
+    prepared_chunks = []
+    seen_chunk_ids = set()
+    for index, chunk in enumerate(chunks):
+        if isinstance(chunk, str):
+            text = chunk
+            chunk_id = f"chunk-{index:06d}"
+            page_number = None
+        else:
+            text = chunk.get("text")
+            chunk_id = chunk.get("chunk_id")
+            page_number = chunk.get("page_number")
+            if not isinstance(text, str):
+                raise ValueError("Each chunk must include text")
+            if not isinstance(chunk_id, str) or not chunk_id.strip():
+                raise ValueError("Each chunk must include a chunk_id")
+            if page_number is not None and (
+                not isinstance(page_number, int)
+                or isinstance(page_number, bool)
+                or page_number < 1
+            ):
+                raise ValueError("page_number must be a positive integer")
+
+        if chunk_id in seen_chunk_ids:
+            raise ValueError("chunk_id values must be unique within a document")
+        seen_chunk_ids.add(chunk_id)
+        prepared_chunks.append((text, chunk_id, page_number))
+
     ids = [
         f"{document_id}_{i}"
-        for i in range(len(chunks))
+        for i in range(len(prepared_chunks))
     ]
 
-    metadatas = [
-        {
+    metadatas = []
+    for index, (text, chunk_id, page_number) in enumerate(prepared_chunks):
+        metadata = {
             "filename": filename,
             "document_id": document_id,
             "document_type": document_type,
-            "chunk_index": i
+            "chunk_index": index,
+            "chunk_id": chunk_id,
         }
-        for i in range(len(chunks))
-    ]
-    if user_id is not None:
-        for metadata in metadatas:
+        if page_number is not None:
+            metadata["page_number"] = page_number
+        if user_id is not None:
             metadata["user_id"] = user_id
+        metadatas.append(metadata)
 
     collection.add(
-        documents=chunks,
+        documents=[text for text, _, _ in prepared_chunks],
         ids=ids,
         metadatas=metadatas
     )
 
     return {
         "document_id": document_id,
-        "chunks_stored": len(chunks)
+        "chunks_stored": len(prepared_chunks)
     }
 
 
