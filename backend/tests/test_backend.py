@@ -1,14 +1,9 @@
-from fastapi.testclient import TestClient
-
 import main
 from database import vector_store
 from services import interview
 from services.ai_provider import LocalInterviewProvider
 from services.chunking import chunk_text
 from services import rag
-
-
-client = TestClient(main.app)
 
 
 def test_chunking_has_expected_overlap_and_validation():
@@ -69,8 +64,8 @@ def test_empty_vector_collection_returns_empty_results(monkeypatch):
     }
 
 
-def test_upload_rejects_non_pdf():
-    response = client.post(
+def test_upload_rejects_non_pdf(authenticated_client):
+    response = authenticated_client.post(
         "/documents/upload",
         files={
             "file": (
@@ -84,17 +79,17 @@ def test_upload_rejects_non_pdf():
     assert response.status_code == 400
 
 
-def test_interview_session_and_evaluation(monkeypatch):
+def test_interview_session_and_evaluation(monkeypatch, authenticated_client):
     monkeypatch.setattr(
         interview,
         "retrieve_context",
-        lambda query, n_results: [],
+        lambda query, n_results, **kwargs: [],
     )
 
     main.interview_service = interview.InterviewService()
     main.interview_service.provider = LocalInterviewProvider()
 
-    response = client.post(
+    response = authenticated_client.post(
         "/interview/start",
         json={
             "role": "Python Developer",
@@ -109,7 +104,7 @@ def test_interview_session_and_evaluation(monkeypatch):
 
     assert response.json()["provider"] == "local"
 
-    question_response = client.post(
+    question_response = authenticated_client.post(
         "/interview/question",
         json={
             "session_id": session_id,
@@ -120,7 +115,7 @@ def test_interview_session_and_evaluation(monkeypatch):
 
     question = question_response.json()["question"]
 
-    evaluation_response = client.post(
+    evaluation_response = authenticated_client.post(
         "/interview/evaluate",
         json={
             "session_id": session_id,
@@ -134,8 +129,8 @@ def test_interview_session_and_evaluation(monkeypatch):
     assert "strengths" in evaluation_response.json()
 
 
-def test_interview_validation_and_missing_session():
-    invalid = client.post(
+def test_interview_validation_and_missing_session(authenticated_client):
+    invalid = authenticated_client.post(
         "/interview/start",
         json={
             "role": "",
@@ -145,7 +140,7 @@ def test_interview_validation_and_missing_session():
 
     assert invalid.status_code == 422
 
-    missing = client.post(
+    missing = authenticated_client.post(
         "/interview/question",
         json={
             "session_id": "missing",
@@ -241,3 +236,222 @@ def test_interview_adapts_difficulty_and_generates_next_question(
         "medium",
         "hard",
     ]
+
+
+def test_evaluation_rejects_wrong_question(monkeypatch):
+    monkeypatch.setattr(
+        interview,
+        "retrieve_context",
+        lambda query, n_results: [],
+    )
+
+    service = interview.InterviewService()
+    service.provider = LocalInterviewProvider()
+
+    session = service.start(
+        "Python Developer", "technical", "medium", 2
+    )
+
+    service.next_question(session.session_id)
+
+    try:
+        service.evaluate(
+            session.session_id,
+            "Some other question",
+            "My answer",
+        )
+    except ValueError as error:
+        assert "Invalid question" in str(error)
+    else:
+        raise AssertionError("Wrong question should be rejected")
+
+    assert session.current_question == 0
+    assert len(session.answers) == 0
+    assert len(session.evaluations) == 0
+
+
+def test_evaluation_rejects_duplicate_submission(monkeypatch):
+    monkeypatch.setattr(
+        interview,
+        "retrieve_context",
+        lambda query, n_results: [],
+    )
+
+    service = interview.InterviewService()
+    service.provider = LocalInterviewProvider()
+
+    session = service.start(
+        "Python Developer", "technical", "medium", 2
+    )
+
+    question = service.next_question(session.session_id)["question"]
+
+    service.evaluate(
+        session.session_id,
+        question,
+        "First answer",
+    )
+
+    try:
+        service.evaluate(
+            session.session_id,
+            question,
+            "Duplicate answer",
+        )
+    except ValueError as error:
+        assert "No active question" in str(error)
+    else:
+        raise AssertionError("Duplicate submission should be rejected")
+
+    assert session.current_question == 1
+    assert len(session.answers) == 1
+    assert len(session.evaluations) == 1
+
+
+def test_evaluation_rejects_when_no_question_was_generated():
+    service = interview.InterviewService()
+    service.provider = LocalInterviewProvider()
+
+    session = service.start(
+        "Python Developer", "technical", "medium", 2
+    )
+
+    try:
+        service.evaluate(
+            session.session_id,
+            "Any question",
+            "My answer",
+        )
+    except ValueError as error:
+        assert "No active question" in str(error)
+    else:
+        raise AssertionError("Evaluation without a question should fail")
+
+    assert session.current_question == 0
+    assert len(session.answers) == 0
+
+
+def test_evaluation_rejects_empty_answer(monkeypatch):
+    monkeypatch.setattr(
+        interview,
+        "retrieve_context",
+        lambda query, n_results: [],
+    )
+
+    service = interview.InterviewService()
+    service.provider = LocalInterviewProvider()
+
+    session = service.start(
+        "Python Developer", "technical", "medium", 2
+    )
+
+    question = service.next_question(session.session_id)["question"]
+
+    try:
+        service.evaluate(
+            session.session_id,
+            question,
+            "   ",
+        )
+    except ValueError as error:
+        assert "Answer cannot be empty" in str(error)
+    else:
+        raise AssertionError("Empty answer should be rejected")
+
+    assert session.current_question == 0
+    assert len(session.answers) == 0
+
+
+def test_evaluation_rejects_after_interview_completion(monkeypatch):
+    monkeypatch.setattr(
+        interview,
+        "retrieve_context",
+        lambda query, n_results: [],
+    )
+
+    service = interview.InterviewService()
+    service.provider = LocalInterviewProvider()
+
+    session = service.start(
+        "Python Developer", "technical", "medium", 1
+    )
+
+    question = service.next_question(session.session_id)["question"]
+
+    service.evaluate(
+        session.session_id,
+        question,
+        "My answer",
+    )
+
+    assert session.status == "completed"
+
+    try:
+        service.evaluate(
+            session.session_id,
+            question,
+            "Another answer",
+        )
+    except ValueError as error:
+        assert "not active" in str(error)
+    else:
+        raise AssertionError("Completed interview should reject evaluation")
+
+    assert session.current_question == 1
+    assert len(session.answers) == 1
+    assert len(session.evaluations) == 1
+
+
+def test_local_provider_generates_different_questions():
+    from services.ai_provider import LocalInterviewProvider
+
+    provider = LocalInterviewProvider()
+
+    first = provider.generate_question(
+        "Java Developer", "Technical", "medium", [], ""
+    )
+
+    history = [{"question": first, "answer": "My answer"}]
+
+    second = provider.generate_question(
+        "Java Developer", "Technical", "medium", history, ""
+    )
+
+    assert first != second
+
+
+def test_local_provider_changes_question_by_difficulty():
+    from services.ai_provider import LocalInterviewProvider
+
+    provider = LocalInterviewProvider()
+
+    easy = provider.generate_question(
+        "Java Developer", "Technical", "easy", [], ""
+    )
+
+    hard = provider.generate_question(
+        "Java Developer", "Technical", "hard", [], ""
+    )
+
+    assert easy != hard
+
+
+def test_local_provider_avoids_multiple_previous_questions():
+    from services.ai_provider import LocalInterviewProvider
+
+    provider = LocalInterviewProvider()
+
+    questions = provider.generate_questions(
+        "Java Developer", "Technical", "medium", 5, ""
+    )
+
+    history = [
+        {"question": question, "answer": "Previous answer"}
+        for question in questions[:3]
+    ]
+
+    next_question = provider.generate_question(
+        "Java Developer", "Technical", "medium", history, ""
+    )
+
+    assert next_question not in questions[:3]

@@ -83,6 +83,7 @@ class Evaluation:
     improvements: list[str]
 
 
+
 class LocalInterviewProvider:
     """Deterministic offline provider used until an external LLM is configured."""
 
@@ -96,17 +97,25 @@ class LocalInterviewProvider:
         history: list[dict],
         context: str,
     ) -> str:
-        question = self.generate_questions(
-            role, interview_type, difficulty, 1, context
-        )[0]
 
-        if history:
-            question = (
-                f"As a follow-up, "
-                f"{question[0].lower() + question[1:]}"
-            )
+        questions = self.generate_questions(
+            role, interview_type, difficulty, 5, context
+        )
 
-        return question
+        # Avoid questions that have already been asked
+        previous_questions = {
+            item["question"].strip().lower()
+            for item in history
+        }
+
+        for question in questions:
+            if question.strip().lower() not in previous_questions:
+                return question
+
+        return (
+            f"Describe a new technical challenge you would solve "
+            f"as a {role}, and explain your approach."
+        )
 
     def generate_questions(
         self,
@@ -116,21 +125,42 @@ class LocalInterviewProvider:
         number: int,
         context: str,
     ) -> list[str]:
+
         technologies = self._technologies(context)
         focus = ", ".join(technologies[:3]) or role
 
-        templates = [
-            f"How would you explain your experience with {focus} in a {role} project?",
-            f"What design or implementation trade-offs did you make while working with {focus}?",
-            f"How would you test and troubleshoot a {interview_type} solution for {role}?",
-            f"Describe a difficult problem related to {focus} and how you solved it.",
-            f"How would you improve the reliability and maintainability of your {role} work?",
-        ]
+        templates = {
+            "easy": [
+                f"What is {focus}, and where would you use it in a {role} project?",
+                f"Explain the basic concepts of {focus} relevant to a {role}.",
+                f"What are the main responsibilities of a {role}?",
+                f"How would you perform a basic {interview_type} task as a {role}?",
+                f"What common problems might a beginner face when using {focus}?"
+            ],
 
-        return [
-            templates[index % len(templates)]
-            for index in range(number)
-        ]
+            "medium": [
+                f"How would you explain your experience with {focus} in a {role} project?",
+                f"What design or implementation trade-offs did you make while working with {focus}?",
+                f"How would you test and troubleshoot a {interview_type} solution for {role}?",
+                f"Describe a difficult problem related to {focus} and how you solved it.",
+                f"How would you improve the reliability and maintainability of your {role} work?"
+            ],
+
+            "hard": [
+                f"How would you design a scalable {role} system using {focus}, and what trade-offs would you consider?",
+                f"How would you diagnose a complex performance bottleneck involving {focus}?",
+                f"How would you architect a fault-tolerant {interview_type} solution for a large-scale {role} application?",
+                f"What failure scenarios could occur in a system using {focus}, and how would you mitigate them?",
+                f"How would you optimize a {role} system when its existing architecture cannot handle increasing traffic?"
+            ]
+        }
+
+        selected = templates.get(
+            difficulty.lower(),
+            templates["medium"]
+        )
+
+        return selected[:number]
 
     def evaluate_answer(
         self,
@@ -149,10 +179,7 @@ class LocalInterviewProvider:
 
         score = min(
             10,
-            max(
-                1,
-                3 + min(4, len(words) // 20),
-            ),
+            max(1, 3 + min(4, len(words) // 20))
         )
 
         strengths = []
@@ -169,12 +196,7 @@ class LocalInterviewProvider:
 
         if any(
             marker in answer.lower()
-            for marker in (
-                "because",
-                "trade-off",
-                "test",
-                "example",
-            )
+            for marker in ("because", "trade-off", "test", "example")
         ):
             strengths.append(
                 "The answer includes reasoning or supporting detail."
@@ -194,10 +216,8 @@ class LocalInterviewProvider:
             improvement_suggestions=improvements,
             follow_up_required=score < 7,
             next_difficulty=(
-                "hard"
-                if score >= 8
-                else "medium"
-                if score >= 5
+                "hard" if score >= 8
+                else "medium" if score >= 5
                 else "easy"
             ),
         )
@@ -205,29 +225,18 @@ class LocalInterviewProvider:
     @staticmethod
     def _technologies(context: str) -> list[str]:
         known = [
-            "Python",
-            "FastAPI",
-            "ChromaDB",
-            "RAG",
-            "PostgreSQL",
-            "Docker",
-            "JavaScript",
-            "React",
-            "SQL",
-            "Git",
-            "AWS",
+            "Python", "FastAPI", "ChromaDB", "RAG",
+            "PostgreSQL", "Docker", "JavaScript",
+            "React", "SQL", "Git", "AWS",
             "Machine Learning",
         ]
 
         return [
             technology
             for technology in known
-            if re.search(
-                re.escape(technology),
-                context,
-                re.I,
-            )
+            if re.search(re.escape(technology), context, re.I)
         ]
+
 
 
 class OpenAIProvider:

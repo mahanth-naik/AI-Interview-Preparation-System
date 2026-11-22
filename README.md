@@ -1,109 +1,155 @@
 # AI Interview Preparation System
 
-Backend foundation for a college Additional Project (ADP) that prepares candidates for interviews using document retrieval and an interview-session workflow. The frontend is not implemented yet.
+ADP is a resume-aware interview practice application. FastAPI serves authenticated document retrieval, interview sessions and reports; React provides the browser interface. User accounts and interview/document ownership are stored in SQLite, and candidate document chunks are indexed in ChromaDB.
 
-## Current Progress
+## Features
 
-The backend supports PDF ingestion, text chunking, ChromaDB semantic retrieval, RAG-backed interview turns, an LLM provider abstraction, structured answer evaluation, and AutoGen interviewer/evaluator orchestration. The local provider is the default, so development and tests work without an API key.
+- Upload a resume PDF, extract its text, chunk it, and store candidate-specific chunks in ChromaDB.
+- Create technical, behavioral, or mixed interview sessions for a target role.
+- Generate one question at a time using the selected provider and optional resume context.
+- Evaluate submitted answers, retain structured feedback, and adjust the next question's difficulty.
+- Resume in-progress sessions after restarting the backend.
+- Review completed reports with an overall score, per-question scores, strengths, weaknesses, and recommendations.
+- Browse and continue previous sessions from the frontend.
+- Register and sign in with Argon2-hashed passwords and revocable JWT access tokens.
+- Keep resume retrieval, interview sessions, history, evaluations, and reports scoped to the signed-in user.
 
 ## Architecture
 
 ```text
-PDF resume/document
-  -> pypdf text extraction
-  -> validated text chunks
-  -> ChromaDB persistent vector collection
-  -> retrieval for each interview turn
-  -> retrieval/context construction
-  -> AutoGen SelectorGroupChat -> InterviewerAgent -> question
-  -> AutoGen SelectorGroupChat -> EvaluatorAgent -> structured evaluation
+Resume PDF -> pypdf -> user-tagged chunks -> ChromaDB
+                                          |
+React UI -> FastAPI -> JWT identity -> owner-scoped RAG context
+                           |          -> InterviewService -> selected LLM provider
+                           |                           -> SQLite session and report data
+                           +-> SQLite accounts, document ownership, and token revocation
 ```
+
+`backend/main.py` defines the HTTP API and applies the authenticated user identity to document and interview operations. `backend/services/interview.py` owns interview progression and report creation. `backend/database/session_store.py` persists the owner and session fields, including JSON question/answer/evaluation history, in `backend/database/interviews.sqlite3` by default. `backend/database/document_store.py` records resume ownership in that same database. `INTERVIEW_DB_PATH` can override this location. ChromaDB continues to persist document vectors separately under `backend/database/chroma/`; new chunks carry both `document_id` and `user_id` metadata, and retrieval filters on the user.
+
+The frontend lives in `frontend/` and talks to FastAPI. `document_id` returned from resume upload is sent when starting a session so RAG searches stay scoped to that resume. The `session_id` returned by session creation is used for question, answer, resume, status, and report requests.
+
+## LLM configuration
+
+Create `.env` from `.env.example` only when you do not already have a local `.env`. The default `LLM_PROVIDER=local` runs deterministic, offline question and evaluation logic. To use Gemini with AutoGen, set:
 
 ```text
-start session -> retrieve context -> generate question
-       ^                                  |
-       |                                  v
-next question <- evaluate answer <- submit answer
-                 (difficulty and follow-up update)
+LLM_PROVIDER=autogen
+GEMINI_MODEL=gemini-3-flash-preview
+GEMINI_API_KEY=your-key
 ```
 
-The backend keeps route handling in `main.py`. Chunking, retrieval, provider, orchestration, and session logic live under `backend/services/`. Chroma data is persisted under `backend/database/chroma/` and uploaded source files are kept under `backend/uploads/` for local development.
+The key is read from the environment and must not be committed. AutoGen builds a `SelectorGroupChat` containing separate interviewer and evaluator agents; both use Gemini through Google's OpenAI-compatible endpoint. `LLM_PROVIDER=gemini` selects the direct Gemini adapter without AutoGen. `LLM_PROVIDER=openai` selects the OpenAI adapter. The example configuration keeps the offline provider as its default to avoid making external calls unexpectedly.
 
-## API
+`FRONTEND_ORIGINS` is a comma-separated CORS allow-list and defaults to the Vite development origins `http://localhost:5173,http://127.0.0.1:5173`.
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| GET | `/` | API status message |
-| GET | `/health` | Health check |
-| POST | `/documents/upload` | Extract and store a readable PDF |
-| GET | `/documents/search?query=Python&n_results=3` | Return relevant chunks |
-| GET | `/ask?query=Python&n_results=3` | Backward-compatible context response |
-| POST | `/interview/start` | Create a session |
-| POST | `/interview/question` | Generate or return the current question |
-| POST | `/interview/evaluate` | Evaluate an answer and advance the session |
-| GET | `/interview/{session_id}` | Return session state |
+## Authentication and ownership
 
-Evaluation responses retain `score`, `feedback`, `strengths`, and `improvements`. They also contain validated dimension scores, weaknesses, improvement suggestions, `follow_up_required`, and `next_difficulty`.
+The backend exposes:
 
-## LLM Configuration
+- `POST /auth/register` with `full_name`, `email`, and a password (12–128 characters).
+- `POST /auth/login` with `email` and `password`; returns a short-lived bearer access token and public user details.
+- `GET /auth/me` with `Authorization: Bearer <access_token>`.
+- `POST /auth/logout` with the same bearer token; stores its JWT ID in SQLite so it cannot be reused.
 
-Copy `.env.example` to `.env` and set the provider as needed:
-
-```text
-LLM_PROVIDER=local
-LLM_MODEL=gpt-4o-mini
-OPENAI_API_KEY=
-```
-
-Use `LLM_PROVIDER=openai` for direct OpenAI chat completions or `LLM_PROVIDER=autogen` for the AutoGen adapter. The AutoGen adapter creates two distinct `AssistantAgent` instances in one `SelectorGroupChat`: `InterviewerAgent` generates one question and `EvaluatorAgent` returns `EvaluationResult` JSON. Retrieval remains in `InterviewService`; the resulting context is passed into each agent task. The API key is read from the environment only and is never stored in source code. `local` is the offline default.
-
-## Setup and Run (Windows PowerShell)
+Passwords are hashed with pwdlib's recommended Argon2id hasher. Only the password hash is saved in the `users` table. JWTs use HS256, include an issuer and expiration, and are checked against the SQLite revocation table. All resume, RAG search, interview, history, status, and report endpoints require a bearer token. SQLite checks the current user's ownership before returning or changing a session/document, and ChromaDB searches include a `user_id` metadata filter. Configure `JWT_SECRET_KEY` in the ignored local `.env` with a randomly generated value of at least 32 characters. For example, generate a value locally in PowerShell with:
 
 ```powershell
-cd C:\Users\mahan\OneDrive\Desktop\AI-Interview-Preparation-System
-.\backend\venv\Scripts\Activate.ps1
-python -m pip install -r .\backend\requirements.txt
-cd .\backend
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Set `JWT_ACCESS_TOKEN_MINUTES` to an integer from 1 to 1440; it defaults to 30. Authentication routes return `503` when the JWT secret or lifetime configuration is invalid. Logout revokes that token immediately. The React app keeps the access token in tab-scoped `sessionStorage`, clears it on logout, and returns to sign-in when the API rejects an expired token.
+
+## Setup on Windows
+
+Use two PowerShell terminals from the repository root.
+
+### Backend
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+py -m venv .venv              # only if the environment does not exist
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+Set-Location backend
 python -m uvicorn main:app --reload
 ```
 
-The API is available at `http://127.0.0.1:8000`; interactive documentation is available at `/docs`.
+The API is at `http://127.0.0.1:8000`; Swagger UI is at `http://127.0.0.1:8000/docs`.
 
-## Testing
+### Frontend
 
 ```powershell
-cd C:\Users\mahan\OneDrive\Desktop\AI-Interview-Preparation-System\backend
-.\venv\Scripts\python.exe -m pytest -q
-.\venv\Scripts\python.exe -m compileall -q main.py services database tests
+Set-Location frontend
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+npm install
+npm run dev
 ```
 
-Tests use fake LLM clients and mocked retrieval, so they do not make paid API calls. They cover missing configuration, malformed responses, RAG-backed question generation, structured evaluation, provider selection, and AutoGen role orchestration. On the current Windows environment, test collection is blocked before any test body runs because Application Control blocks the installed `pydantic_core` DLL. No test pass result is claimed until that environment restriction is resolved by its administrator.
+Open the Vite URL printed in the terminal (normally `http://localhost:5173`).
 
-## Project Structure
+## API workflow
+
+### Authentication
+
+1. `POST /auth/register` with `{"full_name":"Ada Lovelace","email":"ada@example.com","password":"a-long-password-value"}` creates a SQLite user.
+2. `POST /auth/login` returns an access token; include it as `Authorization: Bearer <access_token>` on protected requests.
+3. `GET /auth/me` returns the authenticated user's public profile.
+4. `POST /auth/logout` revokes the presented access token.
+
+### Interview and document workflow (authenticated)
+
+Include the bearer token from login in every request below.
+
+1. `POST /documents/upload` with multipart field `file` (PDF) returns a `document_id` owned by the signed-in user.
+2. `POST /interview/start` with JSON `role`, `interview_type`, optional `difficulty`, `number_of_questions`, and optional owned `document_id` returns `session_id`.
+3. `POST /interview/question` with `{"session_id":"..."}` returns the active question. Calling it again after evaluation generates the next question.
+4. `POST /interview/evaluate` with `session_id`, the active `question`, and `answer` evaluates and saves the answer.
+5. `GET /interview/{session_id}` returns the persisted session state.
+6. `GET /interview/{session_id}/report` returns a final report after all configured questions are evaluated. It responds with `409` while the interview is still active.
+7. `GET /interviews?limit=50` lists recent sessions for the dashboard/history screen.
+
+The service rejects answers for a question that is not the active session question. Question and answer history, active question, difficulty, and completion status are saved to SQLite.
+
+## Tests and verification
+
+From the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q backend\tests
+.\.venv\Scripts\python.exe -m compileall -q backend\main.py backend\services backend\database backend\tests
+Set-Location frontend
+npm test
+npm run build
+```
+
+Backend tests use fake providers and temporary SQLite databases, so they do not call Gemini or consume API credits. Frontend API tests use mocked `fetch`; `npm run build` checks the React production bundle.
+
+## Project structure
 
 ```text
 backend/
-  main.py
-  requirements.txt
   database/
+    session_store.py
     vector_store.py
-    chroma/                 # ignored generated data
   services/
-    chunking.py
-    rag.py
     ai_provider.py
     autogen_orchestration.py
     interview.py
+    rag.py
+    chunking.py
   tests/
-    test_backend.py
-    test_llm_workflow.py
-  uploads/                  # ignored local uploads
+frontend/
+  src/
+    App.jsx
+    api.js
+    styles.css
 ```
 
-## Remaining Limitations
+## Current boundaries
 
-- Sessions are in memory and are not authenticated or persistent.
-- Document extraction currently targets PDFs.
-- The frontend is not implemented.
-- AutoGen is currently exposed through the existing synchronous provider interface. Its `run_async` path is available for async callers; synchronous FastAPI routes use the boundary adapter without nesting an event loop.
-- AutoGen and OpenAI providers require an API key and installed external packages; tests mock those calls.
+- SQLite and ChromaDB are local persistent stores; configure durable storage/backups for deployment.
+- Existing pre-authentication interview rows are preserved by the additive `user_id` migration, but remain unowned and are not exposed to any account. Existing ChromaDB chunks without `user_id` metadata are likewise preserved but excluded from authenticated searches. No automatic account claiming is performed because the original owner cannot be established safely.
+- The API does not include refresh tokens or account recovery.
+- Resume uploads accept PDF files with extractable text.
+- The offline provider is intended for local demos/tests; realistic LLM feedback requires a configured external provider.

@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 from typing import Any, Sequence
@@ -13,23 +14,31 @@ from services.ai_provider import (
 class AutoGenOrchestrator:
     """Routes interview tasks through a two-agent AutoGen workflow."""
 
-    INTERVIEWER_SYSTEM_MESSAGE = """You are InterviewerAgent in an interview workflow.
-Generate exactly one interview question. Use the supplied candidate/RAG context,
-role, interview type, difficulty, and interview history. Ask an appropriate
-follow-up when history or the previous answer requires it. Never invent candidate
-facts. Return only the question, with no explanation or numbering."""
+    INTERVIEWER_SYSTEM_MESSAGE = """
+You are InterviewerAgent in an interview workflow.
 
-    EVALUATOR_SYSTEM_MESSAGE = """You are EvaluatorAgent in an interview workflow.
+Generate exactly one interview question.
+Use the supplied candidate/RAG context, role, interview type,
+difficulty, and interview history.
 
-Evaluate the candidate answer using the supplied question, candidate/RAG context,
-role, and difficulty.
+Do not repeat previous questions.
+Ask an appropriate follow-up when history or the previous answer
+requires it.
+Never invent candidate facts.
+Return only the question, without explanation or numbering.
+"""
+
+    EVALUATOR_SYSTEM_MESSAGE = """
+You are EvaluatorAgent in an interview workflow.
+
+Evaluate the candidate answer using the supplied question,
+candidate/RAG context, role, and difficulty.
 
 Return ONLY one valid JSON object.
-Do not return markdown.
-Do not use code fences.
-Do not return any explanation outside the JSON object.
+Do not return markdown or code fences.
+Do not return explanations outside the JSON.
 
-The JSON MUST contain exactly these fields:
+The JSON must contain exactly these fields:
 
 technical_correctness: integer from 1 to 10
 relevance: integer from 1 to 10
@@ -39,46 +48,20 @@ strengths: array of strings
 weaknesses: array of strings
 improvement_suggestions: array of strings
 follow_up_required: boolean
-next_difficulty: exactly one of "easy", "medium", or "hard"
+next_difficulty: "easy", "medium", or "hard"
 
-IMPORTANT:
-- strengths MUST be an array of strings, even if there is only one strength.
-- weaknesses MUST be an array of strings, even if there is only one weakness.
-- improvement_suggestions MUST be an array of strings, even if there is only one suggestion.
-- follow_up_required MUST be true or false, not a string.
-- technical_correctness, relevance, completeness, and clarity MUST be integers.
-- next_difficulty MUST be exactly "easy", "medium", or "hard".
-- Never invent candidate facts.
-
-Example of the required JSON structure:
-{
-  "technical_correctness": 8,
-  "relevance": 9,
-  "completeness": 7,
-  "clarity": 8,
-  "strengths": [
-    "Correctly explains the main concept"
-  ],
-  "weaknesses": [
-    "Does not provide an example"
-  ],
-  "improvement_suggestions": [
-    "Add a concrete code example"
-  ],
-  "follow_up_required": true,
-  "next_difficulty": "medium"
-}
+Never invent candidate facts.
 """
 
     @staticmethod
-    def _select_agent(messages: Sequence[Any]) -> str | None:
-        """Select the agent requested by the routing task."""
+    def _select_agent(messages: Sequence[Any]) -> str:
+        """Select the agent based on the latest routing task."""
+
         if not messages:
             return "interviewer_agent"
 
-        last_message = messages[-1]
+        content = getattr(messages[-1], "content", "")
 
-        content = getattr(last_message, "content", "")
         if not isinstance(content, str):
             content = str(content)
 
@@ -88,12 +71,9 @@ Example of the required JSON structure:
         if "Requested role: interviewer" in content:
             return "interviewer_agent"
 
-        return None
+        return "interviewer_agent"
 
     def __init__(self, model: str, api_key: str):
-        # AutoGen's workflow contains asyncio objects such as queues.
-        # Keep one event loop for the lifetime of this orchestrator so that
-        # multiple interview calls reuse the same loop.
         self._event_loop = asyncio.new_event_loop()
 
         try:
@@ -101,6 +81,7 @@ Example of the required JSON structure:
             from autogen_agentchat.conditions import MaxMessageTermination
             from autogen_agentchat.teams import SelectorGroupChat
             from autogen_ext.models.openai import OpenAIChatCompletionClient
+
         except ImportError as exc:
             raise LLMConfigurationError(
                 "autogen-agentchat and autogen-ext[openai] are required "
@@ -110,7 +91,10 @@ Example of the required JSON structure:
         self.model_client = OpenAIChatCompletionClient(
             model=model,
             api_key=api_key,
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            base_url=(
+                "https://generativelanguage.googleapis.com/"
+                "v1beta/openai/"
+            ),
             model_info={
                 "vision": False,
                 "function_calling": True,
@@ -138,11 +122,11 @@ Example of the required JSON structure:
             termination_condition=MaxMessageTermination(2),
             selector_func=self._select_agent,
             selector_prompt=(
-                "Select exactly one agent for each task. Select interviewer_agent "
-                "when the task requests a question. Select evaluator_agent when "
-                "the task requests evaluation JSON. Do not select the other role."
+                "Select interviewer_agent for question generation. "
+                "Select evaluator_agent for evaluation JSON."
             ),
         )
+
 
     async def run_async(self, role_name: str, task: str) -> str:
         if role_name not in {"interviewer", "evaluator"}:
@@ -157,25 +141,38 @@ Example of the required JSON structure:
 
         try:
             result = await self.workflow.run(task=routing_task)
-            return str(result.messages[-1].content)
+
+            if not result.messages:
+                raise LLMProviderError(
+                    "AutoGen returned no messages"
+                )
+
+            # The final message contains the agent's response
+            content = result.messages[-1].content
+
+            if not isinstance(content, str) or not content.strip():
+                raise LLMProviderError(
+                    "AutoGen returned an empty response"
+                )
+
+            return content.strip()
+
+        except LLMProviderError:
+            raise
+
         except Exception as exc:
             raise LLMProviderError(
                 f"AutoGen workflow failed: {exc}"
             ) from exc
 
-    def run(self, role_name: str, task: str) -> str:
-        """Run AutoGen using one persistent event loop.
 
-        The synchronous InterviewProvider interface may call this method
-        multiple times during one interview session. AutoGen's workflow
-        contains asyncio objects that must remain associated with the same
-        event loop.
-        """
+
+    def run(self, role_name: str, task: str) -> str:
+        """Run AutoGen using the persistent event loop."""
+
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # Some unit tests construct the orchestrator with __new__ and
-            # therefore bypass __init__. Create the loop lazily in that case.
             if not hasattr(self, "_event_loop"):
                 self._event_loop = asyncio.new_event_loop()
 
@@ -183,21 +180,23 @@ Example of the required JSON structure:
                 return self._event_loop.run_until_complete(
                     self.run_async(role_name, task)
                 )
+            except LLMProviderError:
+                raise
             except Exception as exc:
-                if isinstance(exc, LLMProviderError):
-                    raise
-
                 raise LLMProviderError(
                     f"AutoGen workflow failed: {exc}"
                 ) from exc
 
         raise LLMProviderError(
-            "AutoGen async workflow cannot run inside an active event loop; "
-            "use run_async"
+            "AutoGen cannot run synchronously inside an active "
+            "event loop; use run_async instead"
         )
 
 
+
 class AutoGenProvider:
+    """Interview provider backed by AutoGen and Gemini."""
+
     name = "autogen"
 
     def __init__(
@@ -207,6 +206,7 @@ class AutoGenProvider:
         orchestrator: Any = None,
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+
         self.model = model or os.getenv(
             "GEMINI_MODEL",
             "gemini-3-flash-preview",
@@ -214,7 +214,7 @@ class AutoGenProvider:
 
         if not self.api_key:
             raise LLMConfigurationError(
-                "GEMINI_API_KEY is required when using the AutoGen provider"
+                "GEMINI_API_KEY is required when using AutoGen"
             )
 
         self.orchestrator = orchestrator or AutoGenOrchestrator(
@@ -240,12 +240,21 @@ class AutoGenProvider:
         history: list[dict],
         context: str,
     ) -> str:
+
         return self.orchestrator.run(
             "interviewer",
-            f"Generate exactly one {difficulty} "
-            f"{interview_type} interview question for a {role}.\n"
-            f"Candidate/RAG context:\n{context}\n"
-            f"Interview history:\n{history}",
+            f"""
+Generate exactly one {difficulty} {interview_type}
+interview question for a {role}.
+
+Do not repeat any question in the history.
+
+Candidate/RAG context:
+{context}
+
+Interview history:
+{history}
+""",
         )
 
     def evaluate_answer(
@@ -256,21 +265,27 @@ class AutoGenProvider:
         context: str,
         difficulty: str,
     ) -> EvaluationResult:
+
         raw = self.orchestrator.run(
             "evaluator",
-            f"Evaluate this answer as JSON. "
-            f"Role: {role}. "
-            f"Question: {question}. "
-            f"Answer: {answer}. "
-            f"Candidate/RAG context: {context}. "
-            f"Current difficulty: {difficulty}. "
-            "Return every EvaluationResult field.",
+            f"""
+Evaluate this interview answer.
+
+Role: {role}
+Question: {question}
+Answer: {answer}
+Candidate/RAG context: {context}
+Current difficulty: {difficulty}
+
+Return every required EvaluationResult field as valid JSON.
+""",
         )
 
         try:
             return EvaluationResult.model_validate_json(
                 _strip_json_fence(raw)
             )
+
         except (ValueError, TypeError) as exc:
             raise LLMProviderError(
                 "AutoGen evaluator returned malformed evaluation JSON"
