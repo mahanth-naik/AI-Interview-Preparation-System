@@ -9,11 +9,25 @@ class FakeProvider:
     name = "fake"
 
     def generate_question(
-        self, role, interview_type, difficulty, history, context
+        self,
+        role,
+        interview_type,
+        difficulty,
+        history,
+        context,
+        context_mode="general",
     ):
         return f"{difficulty} question {len(history) + 1}"
 
-    def evaluate_answer(self, role, question, answer, context, difficulty):
+    def evaluate_answer(
+        self,
+        role,
+        question,
+        answer,
+        context,
+        difficulty,
+        context_mode="general",
+    ):
         return EvaluationResult(
             technical_correctness=8,
             relevance=9,

@@ -4,9 +4,11 @@ from uuid import uuid4
 
 from services.ai_provider import (
     EvaluationResult,
+    InterviewContextMode,
     InterviewProvider,
     get_interview_provider,
 )
+from database.document_store import SQLiteDocumentStore
 from database.session_store import SQLiteSessionStore
 from services.rag import build_context, retrieve_context
 
@@ -43,6 +45,7 @@ class InterviewService:
         self.sessions: dict[str, InterviewSession] = {}
         self.provider = provider or get_interview_provider()
         self.store = store or SQLiteSessionStore()
+        self.document_store = SQLiteDocumentStore(self.store.database_path)
 
     def start(
         self,
@@ -92,13 +95,15 @@ class InterviewService:
     def _retrieve_session_context(
         self,
         session: InterviewSession,
-        query: str
+        query: str,
+        document_type: InterviewContextMode | None = None,
     ) -> list[dict]:
         if (
             not isinstance(session.user_id, str)
             or not session.user_id.strip()
             or not isinstance(session.document_id, str)
             or not session.document_id.strip()
+            or document_type not in {"resume", "study_material"}
         ):
             return []
 
@@ -107,7 +112,65 @@ class InterviewService:
             3,
             document_id=session.document_id,
             user_id=session.user_id,
+            document_type=document_type,
         )
+
+    def _session_document_type(
+        self,
+        session: InterviewSession,
+    ) -> InterviewContextMode | None:
+        if not session.document_id or not session.user_id:
+            return None
+
+        document = self.document_store.get_for_user(
+            session.document_id,
+            session.user_id,
+        )
+        if document is None:
+            raise ValueError("The selected document is no longer available.")
+        if document["processing_status"] != "ready":
+            raise ValueError("The selected document is not ready for interviews.")
+
+        if document["document_type"] == "resume":
+            return "resume"
+        if document["document_type"] == "study_material":
+            return "study_material"
+        raise ValueError("The selected document has an unsupported type.")
+
+    @staticmethod
+    def _question_retrieval_query(
+        session: InterviewSession,
+        document_type: InterviewContextMode | None,
+    ) -> str:
+        if document_type == "resume":
+            return (
+                f"resume skills technologies projects and work experience "
+                f"relevant to {session.role} {session.interview_type}"
+            )
+        if document_type == "study_material":
+            return (
+                "key concepts definitions principles processes and "
+                "explanations in the selected study material"
+            )
+        return f"{session.role} {session.interview_type}"
+
+    @staticmethod
+    def _evaluation_retrieval_query(
+        session: InterviewSession,
+        question: str,
+        document_type: InterviewContextMode | None,
+    ) -> str:
+        if document_type == "resume":
+            return (
+                f"resume skills technologies projects and experience "
+                f"relevant to the {session.role} interview question: {question}"
+            )
+        if document_type == "study_material":
+            return (
+                "study-material evidence relevant to this interview question: "
+                f"{question}"
+            )
+        return f"{session.role} {question}"
 
     def next_question(
         self, session_id: str, user_id: str | None = None
@@ -136,14 +199,22 @@ class InterviewService:
 
         # Generate a question only when one does not already exist.
         if session.current_question == len(session.questions):
+            document_type = self._session_document_type(session)
 
             context_items = self._retrieve_session_context(
                 session,
-                f"{session.role} {session.interview_type}"
+                self._question_retrieval_query(session, document_type),
+                document_type,
             )
 
+            if document_type is not None and not context_items:
+                raise ValueError(
+                    "No relevant content was found in the selected document."
+                )
+
             context = build_context(
-                [item["text"] for item in context_items]
+                [item["text"] for item in context_items],
+                document_type,
             )
 
             question = self.provider.generate_question(
@@ -151,7 +222,8 @@ class InterviewService:
                 session.interview_type,
                 session.current_difficulty,
                 session.answers,
-                context
+                context,
+                context_mode=document_type or "general",
             )
 
             session.questions.append(question)
@@ -207,14 +279,25 @@ class InterviewService:
         if not answer or not answer.strip():
             raise ValueError("Answer cannot be empty.")
 
-        # Retrieve context from the selected candidate document.
+        document_type = self._session_document_type(session)
         context_items = self._retrieve_session_context(
             session,
-            f"{session.role} {question} {answer}"
+            self._evaluation_retrieval_query(
+                session,
+                question,
+                document_type,
+            ),
+            document_type,
         )
 
+        if document_type == "study_material" and not context_items:
+            raise ValueError(
+                "No relevant study-material evidence was found for this question."
+            )
+
         context = build_context(
-            [item["text"] for item in context_items]
+            [item["text"] for item in context_items],
+            document_type,
         )
 
         # Evaluate the answer.
@@ -223,7 +306,8 @@ class InterviewService:
             question,
             answer,
             context,
-            session.current_difficulty
+            session.current_difficulty,
+            context_mode=document_type or "general",
         )
 
         # Convert evaluation into a dictionary.

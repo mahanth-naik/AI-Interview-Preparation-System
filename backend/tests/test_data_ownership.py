@@ -189,15 +189,29 @@ def test_interview_retrieval_passes_owner_and_selected_document(
         document_id="document-1",
         user_id="user-1",
     )
+    service.document_store.register(
+        "document-1",
+        "user-1",
+        "resume.pdf",
+        document_type="resume",
+    )
 
-    assert service._retrieve_session_context(session, "query") == [
+    assert service._retrieve_session_context(
+        session,
+        "query",
+        "resume",
+    ) == [
         {"text": "selected document chunk"}
     ]
     assert calls == [
         (
             "query",
             3,
-            {"document_id": "document-1", "user_id": "user-1"},
+            {
+                "document_id": "document-1",
+                "user_id": "user-1",
+                "document_type": "resume",
+            },
         )
     ]
 

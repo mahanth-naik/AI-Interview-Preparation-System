@@ -50,16 +50,24 @@ def retrieve_context(
     ]
 
 
-def build_context(documents: list[str]) -> str:
+def build_context(
+    documents: list[str],
+    context_mode: str | None = None,
+) -> str:
 
     if not documents:
         return "No relevant information was found."
+
+    heading = {
+        "resume": "Resume evidence",
+        "study_material": "Study-material evidence",
+    }.get(context_mode, "Context")
 
     context_parts = []
 
     for i, document in enumerate(documents, start=1):
         context_parts.append(
-            f"[Context {i}]\n{document}"
+            f"[{heading} {i}]\n{document}"
         )
 
     return "\n\n".join(context_parts)

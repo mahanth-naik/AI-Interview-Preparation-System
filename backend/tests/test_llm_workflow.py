@@ -1,20 +1,29 @@
+import json
+
 import pytest
 
 from services.ai_provider import (
     EvaluationResult,
+    GeminiProvider,
     LLMConfigurationError,
     LLMProviderError,
+    LocalInterviewProvider,
     OpenAIProvider,
 )
 from services.autogen_orchestration import AutoGenProvider
 from services import interview
+from services.rag import build_context
+from database.session_store import SQLiteSessionStore
 
 
 class FakeCompletions:
     def __init__(self, content):
         self.content = content
+        self.requests = []
 
     def create(self, **kwargs):
+        self.requests.append(kwargs)
+
         class Message:
             def __init__(self, content):
                 self.content = content
@@ -32,7 +41,12 @@ class FakeCompletions:
 
 class FakeClient:
     def __init__(self, content):
-        self.chat = type("Chat", (), {"completions": FakeCompletions(content)})()
+        self.completions = FakeCompletions(content)
+        self.chat = type(
+            "Chat",
+            (),
+            {"completions": self.completions},
+        )()
 
 
 def valid_evaluation():
@@ -79,27 +93,224 @@ def test_openai_provider_rejects_malformed_evaluation():
         provider.evaluate_answer("Python Developer", "Question", "Answer", "Context", "medium")
 
 
-def test_interview_service_retrieves_context_for_question_and_evaluation(monkeypatch):
+@pytest.mark.parametrize("provider_type", [OpenAIProvider, GeminiProvider])
+def test_llm_provider_prompts_distinguish_resume_and_study_modes(provider_type):
+    resume_client = FakeClient("Ask about the project.")
+    resume_provider = provider_type(api_key="test-key", client=resume_client)
+    resume_context = build_context(
+        ["Built a Python reporting service."],
+        "resume",
+    )
+    resume_provider.generate_question(
+        "Python Developer",
+        "technical",
+        "medium",
+        [],
+        resume_context,
+        context_mode="resume",
+    )
+    resume_messages = resume_client.completions.requests[-1]["messages"]
+
+    assert "explicitly present" in resume_messages[0]["content"]
+    assert "Resume evidence" in resume_messages[1]["content"]
+    assert "Study-material evidence" not in resume_messages[1]["content"]
+    resume_client.completions.content = json.dumps(valid_evaluation())
+
+    study_client = FakeClient(json.dumps(valid_evaluation()))
+    study_provider = provider_type(api_key="test-key", client=study_client)
+    study_context = build_context(
+        ["TCP uses a congestion window to control transmission."],
+        "study_material",
+    )
+    study_provider.generate_question(
+        "Network Engineer",
+        "technical",
+        "medium",
+        [],
+        study_context,
+        context_mode="study_material",
+    )
+    study_question_messages = study_client.completions.requests[-1]["messages"]
+    assert "not candidate experience" in study_question_messages[0]["content"]
+    assert "Study-material evidence" in study_question_messages[1]["content"]
+
+    study_provider.evaluate_answer(
+        "Network Engineer",
+        "What does the congestion window control?",
+        "It limits in-flight data.",
+        study_context,
+        "medium",
+        context_mode="study_material",
+    )
+    study_evaluation_messages = study_client.completions.requests[-1]["messages"]
+    assert "unsupported claims" in study_evaluation_messages[0]["content"]
+    assert "Study-material evidence" in study_evaluation_messages[1]["content"]
+
+    resume_provider.evaluate_answer(
+        "Python Developer",
+        "What is a transaction?",
+        "A unit of work.",
+        resume_context,
+        "medium",
+        context_mode="resume",
+    )
+    resume_evaluation_messages = resume_client.completions.requests[-1]["messages"]
+    assert "every correct technical answer" in resume_evaluation_messages[0]["content"]
+
+
+def test_local_provider_questions_quote_the_selected_source():
+    provider = LocalInterviewProvider()
+    resume_context = build_context(
+        ["Developed a Python reporting service for finance teams."],
+        "resume",
+    )
+    study_context = build_context(
+        ["TCP uses a congestion window to control transmission."],
+        "study_material",
+    )
+
+    resume_question = provider.generate_question(
+        "Python Developer",
+        "technical",
+        "medium",
+        [],
+        resume_context,
+        context_mode="resume",
+    )
+    study_question = provider.generate_question(
+        "Network Engineer",
+        "technical",
+        "medium",
+        [],
+        study_context,
+        context_mode="study_material",
+    )
+
+    assert "Developed a Python reporting service" in resume_question
+    assert "TCP uses a congestion window" in study_question
+    assert "candidate experience" not in study_question.lower()
+
+
+def test_local_study_evaluation_does_not_reward_unmatched_claims():
+    provider = LocalInterviewProvider()
+    context = build_context(
+        ["TCP uses a congestion window to control transmission."],
+        "study_material",
+    )
+
+    result = provider.evaluate_answer(
+        "Network Engineer",
+        "What controls transmission?",
+        "Quantum teleportation controls photosynthesis.",
+        context,
+        "medium",
+        context_mode="study_material",
+    )
+
+    assert result.technical_correctness == 1
+    assert result.score <= 5
+    assert "term overlap only" in result.improvement_suggestions[0]
+
+
+def test_autogen_provider_includes_mode_specific_source_instructions():
+    class FakeOrchestrator:
+        def __init__(self):
+            self.tasks = []
+
+        def run(self, role, task):
+            self.tasks.append((role, task))
+            if role == "evaluator":
+                return json.dumps(valid_evaluation())
+            return "Explain the concept in the passage."
+
+    orchestrator = FakeOrchestrator()
+    provider = AutoGenProvider(
+        api_key="test-key",
+        orchestrator=orchestrator,
+    )
+    context = build_context(
+        ["TCP uses a congestion window to control transmission."],
+        "study_material",
+    )
+    provider.generate_question(
+        "Network Engineer",
+        "technical",
+        "medium",
+        [],
+        context,
+        context_mode="study_material",
+    )
+    provider.evaluate_answer(
+        "Network Engineer",
+        "What does the congestion window control?",
+        "It limits unacknowledged data.",
+        context,
+        "medium",
+        context_mode="study_material",
+    )
+
+    assert "not candidate experience" in orchestrator.tasks[0][1]
+    assert "Study-material evidence" in orchestrator.tasks[0][1]
+    assert "unsupported claims" in orchestrator.tasks[1][1]
+    assert "Study-material evidence" in orchestrator.tasks[1][1]
+
+
+def test_interview_service_retrieves_mode_specific_context_for_question_and_evaluation(
+    tmp_path,
+    monkeypatch,
+):
     class FakeProvider:
         name = "fake"
 
-        def generate_question(self, role, interview_type, difficulty, history, context):
-            assert "candidate context" in context
+        def __init__(self):
+            self.modes = []
+
+        def generate_question(
+            self,
+            role,
+            interview_type,
+            difficulty,
+            history,
+            context,
+            context_mode="general",
+        ):
+            self.modes.append(context_mode)
+            assert context_mode == "resume"
+            assert "Resume evidence" in context
             return "What did you build?"
 
-        def evaluate_answer(self, role, question, answer, context, difficulty):
-            assert "candidate context" in context
+        def evaluate_answer(
+            self,
+            role,
+            question,
+            answer,
+            context,
+            difficulty,
+            context_mode="general",
+        ):
+            self.modes.append(context_mode)
+            assert context_mode == "resume"
+            assert "Resume evidence" in context
             return EvaluationResult(**valid_evaluation())
 
     retrieval_calls = []
 
     def fake_retrieve_context(query, n_results, **filters):
-        retrieval_calls.append(filters)
-        return [{"text": "candidate context"}]
+        retrieval_calls.append((query, filters))
+        return [{"text": "Built a Python reporting service."}]
 
     monkeypatch.setattr(interview, "retrieve_context", fake_retrieve_context)
-    service = interview.InterviewService()
-    service.provider = FakeProvider()
+    provider = FakeProvider()
+    service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / "resume.sqlite3"),
+        provider=provider,
+    )
+    service.document_store.register(
+        "document-1",
+        "user-1",
+        "resume.pdf",
+        document_type="resume",
+    )
     session = service.start(
         "Python Developer",
         "technical",
@@ -112,10 +323,163 @@ def test_interview_service_retrieves_context_for_question_and_evaluation(monkeyp
     result = service.evaluate(session.session_id, question["question"], "A detailed answer")
     assert result["technical_correctness"] == 8
     assert result["next_question_available"] is True
-    assert retrieval_calls == [
-        {"document_id": "document-1", "user_id": "user-1"},
-        {"document_id": "document-1", "user_id": "user-1"},
-    ]
+    assert "resume skills technologies projects" in retrieval_calls[0][0]
+    assert "resume skills technologies projects" in retrieval_calls[1][0]
+    assert "A detailed answer" not in retrieval_calls[1][0]
+    assert all(
+        filters
+        == {
+            "document_id": "document-1",
+            "user_id": "user-1",
+            "document_type": "resume",
+        }
+        for _, filters in retrieval_calls
+    )
+    assert provider.modes == ["resume", "resume"]
+
+
+def test_study_material_interview_uses_source_only_context_and_question_query(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeProvider:
+        name = "fake"
+
+        def __init__(self):
+            self.question_context = None
+            self.evaluation_context = None
+
+        def generate_question(
+            self,
+            role,
+            interview_type,
+            difficulty,
+            history,
+            context,
+            context_mode="general",
+        ):
+            self.question_context = (context_mode, context)
+            assert context_mode == "study_material"
+            assert "Study-material evidence" in context
+            return "What does the congestion window control?"
+
+        def evaluate_answer(
+            self,
+            role,
+            question,
+            answer,
+            context,
+            difficulty,
+            context_mode="general",
+        ):
+            self.evaluation_context = (context_mode, context)
+            assert context_mode == "study_material"
+            assert "Study-material evidence" in context
+            return EvaluationResult(**valid_evaluation())
+
+    retrieval_calls = []
+
+    def fake_retrieve_context(query, n_results, **filters):
+        retrieval_calls.append((query, filters))
+        return [
+            {
+                "text": (
+                    "TCP uses a congestion window to control the amount "
+                    "of unacknowledged data."
+                )
+            }
+        ]
+
+    monkeypatch.setattr(interview, "retrieve_context", fake_retrieve_context)
+    provider = FakeProvider()
+    service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / "study.sqlite3"),
+        provider=provider,
+    )
+    service.document_store.register(
+        "study-document",
+        "user-1",
+        "networking-notes.pdf",
+        document_type="study_material",
+    )
+    session = service.start(
+        "Network Engineer",
+        "technical",
+        "medium",
+        1,
+        document_id="study-document",
+        user_id="user-1",
+    )
+
+    question = service.next_question(session.session_id)
+    evaluation = service.evaluate(
+        session.session_id,
+        question["question"],
+        "The congestion window limits data in transit.",
+    )
+
+    assert "key concepts definitions principles" in retrieval_calls[0][0]
+    assert "congestion window" in retrieval_calls[1][0]
+    assert "The congestion window limits" not in retrieval_calls[1][0]
+    assert all(
+        filters
+        == {
+            "document_id": "study-document",
+            "user_id": "user-1",
+            "document_type": "study_material",
+        }
+        for _, filters in retrieval_calls
+    )
+    assert provider.question_context[0] == "study_material"
+    assert "TCP uses a congestion window" in provider.question_context[1]
+    assert provider.evaluation_context[0] == "study_material"
+    assert "TCP uses a congestion window" in provider.evaluation_context[1]
+    assert evaluation["technical_correctness"] == 8
+
+
+@pytest.mark.parametrize("document_type", ["resume", "study_material"])
+def test_document_interview_does_not_generate_without_retrieved_evidence(
+    tmp_path,
+    monkeypatch,
+    document_type,
+):
+    class UnexpectedProvider:
+        name = "unexpected"
+
+        def generate_question(self, *args, **kwargs):
+            pytest.fail("A question must not be generated without evidence")
+
+        def evaluate_answer(self, *args, **kwargs):
+            pytest.fail("An answer must not be evaluated without evidence")
+
+    monkeypatch.setattr(
+        interview,
+        "retrieve_context",
+        lambda *args, **kwargs: [],
+    )
+    service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / f"{document_type}.sqlite3"),
+        provider=UnexpectedProvider(),
+    )
+    service.document_store.register(
+        "selected-document",
+        "user-1",
+        f"{document_type}.pdf",
+        document_type=document_type,
+    )
+    session = service.start(
+        "Engineer",
+        "technical",
+        "medium",
+        1,
+        document_id="selected-document",
+        user_id="user-1",
+    )
+
+    with pytest.raises(ValueError, match="No relevant content"):
+        service.next_question(session.session_id)
+
+    assert session.questions == []
 
 
 def test_autogen_provider_uses_interviewer_and_evaluator_roles():

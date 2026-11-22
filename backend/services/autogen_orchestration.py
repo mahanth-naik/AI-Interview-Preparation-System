@@ -5,8 +5,11 @@ from typing import Any, Sequence
 
 from services.ai_provider import (
     EvaluationResult,
+    InterviewContextMode,
     LLMConfigurationError,
     LLMProviderError,
+    _evaluation_mode_prompt,
+    _question_mode_prompt,
     _strip_json_fence,
 )
 
@@ -18,13 +21,13 @@ class AutoGenOrchestrator:
 You are InterviewerAgent in an interview workflow.
 
 Generate exactly one interview question.
-Use the supplied candidate/RAG context, role, interview type,
+Use the supplied source context, role, interview type,
 difficulty, and interview history.
 
 Do not repeat previous questions.
 Ask an appropriate follow-up when history or the previous answer
 requires it.
-Never invent candidate facts.
+Follow the mode-specific source instructions in the task.
 Return only the question, without explanation or numbering.
 """
 
@@ -32,7 +35,7 @@ Return only the question, without explanation or numbering.
 You are EvaluatorAgent in an interview workflow.
 
 Evaluate the candidate answer using the supplied question,
-candidate/RAG context, role, and difficulty.
+source context, role, and difficulty.
 
 Return ONLY one valid JSON object.
 Do not return markdown or code fences.
@@ -50,7 +53,7 @@ improvement_suggestions: array of strings
 follow_up_required: boolean
 next_difficulty: "easy", "medium", or "hard"
 
-Never invent candidate facts.
+Follow the mode-specific source instructions in the task.
 """
 
     @staticmethod
@@ -239,17 +242,21 @@ class AutoGenProvider:
         difficulty: str,
         history: list[dict],
         context: str,
+        context_mode: InterviewContextMode = "general",
     ) -> str:
+        mode_instructions, context_label = _question_mode_prompt(context_mode)
 
         return self.orchestrator.run(
             "interviewer",
             f"""
+{mode_instructions}
+
 Generate exactly one {difficulty} {interview_type}
 interview question for a {role}.
 
 Do not repeat any question in the history.
 
-Candidate/RAG context:
+{context_label}:
 {context}
 
 Interview history:
@@ -264,17 +271,21 @@ Interview history:
         answer: str,
         context: str,
         difficulty: str,
+        context_mode: InterviewContextMode = "general",
     ) -> EvaluationResult:
+        mode_instructions, context_label = _evaluation_mode_prompt(context_mode)
 
         raw = self.orchestrator.run(
             "evaluator",
             f"""
+{mode_instructions}
+
 Evaluate this interview answer.
 
 Role: {role}
 Question: {question}
 Answer: {answer}
-Candidate/RAG context: {context}
+{context_label}: {context}
 Current difficulty: {difficulty}
 
 Return every required EvaluationResult field as valid JSON.

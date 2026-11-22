@@ -329,7 +329,13 @@ def test_interview_without_selected_document_does_not_search_all_user_docs(
         name = "test"
 
         def generate_question(
-            self, role, interview_type, difficulty, history, context
+            self,
+            role,
+            interview_type,
+            difficulty,
+            history,
+            context,
+            context_mode="general",
         ):
             return "A question without unrelated document context?"
 

@@ -183,6 +183,7 @@ def test_interview_adapts_difficulty_and_generates_next_question(
             difficulty,
             history,
             context,
+            context_mode="general",
         ):
             self.generated_difficulties.append(difficulty)
             return f"{difficulty} question"
@@ -194,6 +195,7 @@ def test_interview_adapts_difficulty_and_generates_next_question(
             answer,
             context,
             difficulty,
+            context_mode="general",
         ):
             from services.ai_provider import EvaluationResult
 
