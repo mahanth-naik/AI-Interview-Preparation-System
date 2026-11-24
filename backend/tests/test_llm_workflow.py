@@ -93,6 +93,30 @@ def test_openai_provider_rejects_malformed_evaluation():
         provider.evaluate_answer("Python Developer", "Question", "Answer", "Context", "medium")
 
 
+def test_gemini_provider_surfaces_rate_limit_errors():
+    class RateLimitError(Exception):
+        status_code = 429
+
+    client = FakeClient("")
+
+    def rate_limited(**kwargs):
+        raise RateLimitError("rate limit")
+
+    client.completions.create = rate_limited
+    provider = GeminiProvider(api_key="test-key", client=client)
+
+    with pytest.raises(LLMProviderError) as error:
+        provider.generate_question(
+            "Engineer",
+            "technical",
+            "medium",
+            [],
+            "Synthetic context.",
+        )
+
+    assert getattr(error.value.__cause__, "status_code", None) == 429
+
+
 @pytest.mark.parametrize("provider_type", [OpenAIProvider, GeminiProvider])
 def test_llm_provider_prompts_distinguish_resume_and_study_modes(provider_type):
     resume_client = FakeClient("Ask about the project.")
@@ -678,19 +702,45 @@ class FakeWorkflow:
             if selected_agent is self.evaluator_agent
             else "Ask about the candidate's caching design."
         )
-        return type("Result", (), {"messages": [type("Message", (), {"content": response})()]})()
+        task_message = type(
+            "Message",
+            (),
+            {"content": task, "source": "user"},
+        )()
+        agent_message = type(
+            "Message",
+            (),
+            {"content": response, "source": selected_agent.name},
+        )()
+        return type(
+            "Result",
+            (),
+            {"messages": [task_message, agent_message]},
+        )()
+
+
+class FakeAgent:
+    def __init__(self, name):
+        self.name = name
 
 
 def fake_orchestrator():
     from services.autogen_orchestration import AutoGenOrchestrator
 
     orchestrator = object.__new__(AutoGenOrchestrator)
-    orchestrator.interviewer_agent = object()
-    orchestrator.evaluator_agent = object()
-    orchestrator.workflow = FakeWorkflow(
-        orchestrator.interviewer_agent,
-        orchestrator.evaluator_agent,
-    )
+    orchestrator.model_client = None
+
+    def build_workflow():
+        interviewer_agent = FakeAgent("interviewer_agent")
+        evaluator_agent = FakeAgent("evaluator_agent")
+        workflow = FakeWorkflow(
+            interviewer_agent,
+            evaluator_agent,
+        )
+        return interviewer_agent, evaluator_agent, workflow
+
+    orchestrator._build_workflow = build_workflow
+    orchestrator._replace_workflow()
     return orchestrator
 
 
@@ -707,6 +757,138 @@ def test_autogen_orchestrator_routes_roles_and_returns_selected_response():
         orchestrator.interviewer_agent,
         orchestrator.evaluator_agent,
     ]
+
+
+def test_autogen_orchestrator_rebuilds_workflow_after_failure():
+    import asyncio
+
+    orchestrator = fake_orchestrator()
+    failed_workflow = orchestrator.workflow
+    orchestrator._event_loop = asyncio.new_event_loop()
+
+    async def fail_once(task):
+        assert "Requested role: interviewer" in task
+        raise RuntimeError("synthetic workflow failure")
+
+    failed_workflow.run = fail_once
+
+    try:
+        with pytest.raises(
+            LLMProviderError,
+            match="synthetic workflow failure",
+        ):
+            orchestrator.run(
+                "interviewer",
+                "Generate a question.",
+            )
+
+        assert orchestrator.workflow is not failed_workflow
+        assert orchestrator.run(
+            "interviewer",
+            "Generate a question after recovery.",
+        ) == "Ask about the candidate's caching design."
+    finally:
+        orchestrator._event_loop.close()
+
+
+def test_autogen_orchestrator_preserves_cancellation_when_reset_fails():
+    import asyncio
+
+    orchestrator = fake_orchestrator()
+    cancellation = asyncio.CancelledError("synthetic cancellation")
+    reset_error = RuntimeError("synthetic reset failure")
+
+    async def cancel_run(task):
+        raise cancellation
+
+    def fail_reset():
+        raise reset_error
+
+    orchestrator.workflow.run = cancel_run
+    orchestrator._replace_workflow = fail_reset
+
+    with pytest.raises(asyncio.CancelledError) as error:
+        asyncio.run(
+            orchestrator.run_async(
+                "interviewer",
+                "Generate a question.",
+            )
+        )
+
+    assert error.value is cancellation
+    assert error.value.__cause__ is reset_error
+
+
+def test_autogen_orchestrator_preserves_workflow_error_when_reset_fails():
+    import asyncio
+
+    orchestrator = fake_orchestrator()
+    workflow_error = RuntimeError("synthetic workflow failure")
+    reset_error = RuntimeError("synthetic reset failure")
+
+    async def fail_run(task):
+        raise workflow_error
+
+    def fail_reset():
+        raise reset_error
+
+    orchestrator.workflow.run = fail_run
+    orchestrator._replace_workflow = fail_reset
+
+    with pytest.raises(
+        LLMProviderError,
+        match="synthetic workflow failure.*synthetic reset failure",
+    ) as error:
+        asyncio.run(
+            orchestrator.run_async(
+                "interviewer",
+                "Generate a question.",
+            )
+        )
+
+    assert error.value.__cause__ is workflow_error
+
+
+@pytest.mark.parametrize(
+    ("role_name", "expected_source"),
+    [
+        ("interviewer", "interviewer_agent"),
+        ("evaluator", "evaluator_agent"),
+    ],
+)
+def test_autogen_orchestrator_rejects_routing_task_as_response(
+    role_name,
+    expected_source,
+):
+    import asyncio
+
+    orchestrator = fake_orchestrator()
+
+    class RoutingTaskOnlyWorkflow:
+        async def run(self, task):
+            task_message = type(
+                "Message",
+                (),
+                {"content": task, "source": "user"},
+            )()
+            return type(
+                "Result",
+                (),
+                {"messages": [task_message]},
+            )()
+
+    orchestrator.workflow = RoutingTaskOnlyWorkflow()
+
+    with pytest.raises(
+        LLMProviderError,
+        match=f"no response from {expected_source}",
+    ):
+        asyncio.run(
+            orchestrator.run_async(
+                role_name,
+                "Perform the requested task.",
+            )
+        )
 
 
 def test_autogen_orchestrator_rejects_unsupported_role():

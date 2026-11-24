@@ -80,9 +80,6 @@ Follow the mode-specific source instructions in the task.
         self._event_loop = asyncio.new_event_loop()
 
         try:
-            from autogen_agentchat.agents import AssistantAgent
-            from autogen_agentchat.conditions import MaxMessageTermination
-            from autogen_agentchat.teams import SelectorGroupChat
             from autogen_ext.models.openai import OpenAIChatCompletionClient
 
         except ImportError as exc:
@@ -107,20 +104,32 @@ Follow the mode-specific source instructions in the task.
             },
         )
 
-        self.interviewer_agent = AssistantAgent(
+        self._replace_workflow()
+
+    def _build_workflow(self) -> tuple[Any, Any, Any]:
+        try:
+            from autogen_agentchat.agents import AssistantAgent
+            from autogen_agentchat.conditions import MaxMessageTermination
+            from autogen_agentchat.teams import SelectorGroupChat
+
+        except ImportError as exc:
+            raise LLMConfigurationError(
+                "autogen-agentchat and autogen-ext[openai] are required "
+                "for the AutoGen provider"
+            ) from exc
+
+        interviewer_agent = AssistantAgent(
             name="interviewer_agent",
             model_client=self.model_client,
             system_message=self.INTERVIEWER_SYSTEM_MESSAGE,
         )
-
-        self.evaluator_agent = AssistantAgent(
+        evaluator_agent = AssistantAgent(
             name="evaluator_agent",
             model_client=self.model_client,
             system_message=self.EVALUATOR_SYSTEM_MESSAGE,
         )
-
-        self.workflow = SelectorGroupChat(
-            [self.interviewer_agent, self.evaluator_agent],
+        workflow = SelectorGroupChat(
+            [interviewer_agent, evaluator_agent],
             model_client=self.model_client,
             termination_condition=MaxMessageTermination(2),
             selector_func=self._select_agent,
@@ -129,7 +138,14 @@ Follow the mode-specific source instructions in the task.
                 "Select evaluator_agent for evaluation JSON."
             ),
         )
+        return interviewer_agent, evaluator_agent, workflow
 
+    def _replace_workflow(self) -> None:
+        (
+            self.interviewer_agent,
+            self.evaluator_agent,
+            self.workflow,
+        ) = self._build_workflow()
 
     async def run_async(self, role_name: str, task: str) -> str:
         if role_name not in {"interviewer", "evaluator"}:
@@ -150,8 +166,14 @@ Follow the mode-specific source instructions in the task.
                     "AutoGen returned no messages"
                 )
 
-            # The final message contains the agent's response
-            content = result.messages[-1].content
+            final_message = result.messages[-1]
+            expected_source = f"{role_name}_agent"
+            if getattr(final_message, "source", None) != expected_source:
+                raise LLMProviderError(
+                    f"AutoGen returned no response from {expected_source}"
+                )
+
+            content = getattr(final_message, "content", None)
 
             if not isinstance(content, str) or not content.strip():
                 raise LLMProviderError(
@@ -160,15 +182,27 @@ Follow the mode-specific source instructions in the task.
 
             return content.strip()
 
-        except LLMProviderError:
+        except asyncio.CancelledError as exc:
+            try:
+                self._replace_workflow()
+            except Exception as reset_exc:
+                raise exc from reset_exc
             raise
 
         except Exception as exc:
+            try:
+                self._replace_workflow()
+            except Exception as reset_exc:
+                raise LLMProviderError(
+                    f"AutoGen workflow failed: {exc}; "
+                    f"workflow reset also failed: {reset_exc}"
+                ) from exc
+
+            if isinstance(exc, LLMProviderError):
+                raise
             raise LLMProviderError(
                 f"AutoGen workflow failed: {exc}"
             ) from exc
-
-
 
     def run(self, role_name: str, task: str) -> str:
         """Run AutoGen using the persistent event loop."""
