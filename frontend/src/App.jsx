@@ -312,7 +312,6 @@ function App() {
       });
       if (!accountRequestGuard.isCurrent(context)) return;
       setEvaluation(result);
-      setAnswer("");
       await refreshSessions(context);
     } catch (requestError) {
       if (accountRequestGuard.isCurrent(context)) {
@@ -856,7 +855,7 @@ function History({ sessions, loading, onResume, onBack }) {
   );
 }
 
-function InterviewRoom({
+export function InterviewRoom({
   session,
   question,
   answer,
@@ -880,6 +879,10 @@ function InterviewRoom({
         <div className="panel question-panel">
           <div className="question-meta"><span className="step-pill">QUESTION {current}</span>{question?.difficulty && <span className={`difficulty difficulty-${question.difficulty}`}>{question.difficulty} difficulty</span>}</div>
           <h2>{question?.question || (loading ? "Preparing your question…" : "Your next question is ready when you are.")}</h2>
+          <EvidenceList
+            title="Question source evidence"
+            items={question?.evidence}
+          />
           {!evaluation ? (
             question?.question ? (
               <form onSubmit={onSubmit}>
@@ -892,7 +895,12 @@ function InterviewRoom({
               <button className="button button-primary" onClick={onNext} disabled={loading}>{loading ? "Preparing…" : "Load question"} <span>→</span></button>
             )
           ) : (
-            <EvaluationCard evaluation={evaluation} loading={loading} onNext={evaluation.next_question_available ? onNext : onReport} />
+            <EvaluationCard
+              answer={answer}
+              evaluation={evaluation}
+              loading={loading}
+              onNext={evaluation.next_question_available ? onNext : onReport}
+            />
           )}
         </div>
         <aside className="panel coach-panel"><span className="coach-icon">✦</span><p className="eyebrow">A LITTLE REMINDER</p><h3>It’s a conversation, not a test.</h3><p>Think out loud, be specific about what you did, and share what you learned along the way.</p><div className="coach-divider" /><div className="coach-detail"><span>◷</span><small>Your progress is saved automatically. You can come back to this session later.</small></div></aside>
@@ -901,8 +909,9 @@ function InterviewRoom({
   );
 }
 
-function EvaluationCard({ evaluation, loading, onNext }) {
+export function EvaluationCard({ answer, evaluation, loading, onNext }) {
   const score = evaluation.score ?? 0;
+  const evidence = evidenceItems(evaluation.evidence);
   return (
     <section className="evaluation-card" aria-live="polite">
       <div className="evaluation-heading"><div><p className="eyebrow">ANSWER REVIEW</p><h3>Good work. Here’s your feedback.</h3></div><div className="score-badge"><strong>{score}</strong><span>/10</span></div></div>
@@ -914,12 +923,101 @@ function EvaluationCard({ evaluation, loading, onNext }) {
           ["Clarity", evaluation.clarity],
         ].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value ?? "—"}<small>/10</small></strong></div>)}
       </div>
+      {evidence.length > 0 && (
+        <div className="candidate-answer">
+          <h4>Your answer</h4>
+          <p>{answer?.trim() || "No answer provided."}</p>
+        </div>
+      )}
       <div className="feedback-columns">
         <FeedbackList title="What went well" items={evaluation.strengths} tone="positive" />
         <FeedbackList title="Try next time" items={evaluation.weaknesses?.length ? evaluation.weaknesses : evaluation.improvements} tone="improve" />
       </div>
       {evaluation.improvement_suggestions?.length > 0 && <p className="recommendation"><strong>Next step:</strong> {evaluation.improvement_suggestions[0]}</p>}
+      <EvidenceList
+        title="Evaluation source evidence"
+        items={evidence}
+      />
       <button className="button button-primary" onClick={onNext} disabled={loading}>{loading ? "Loading…" : evaluation.next_question_available ? "Continue to next question" : "View final report"} <span>→</span></button>
+    </section>
+  );
+}
+
+function evidenceItems(items) {
+  return Array.isArray(items)
+    ? items.filter(
+        (item) => item && typeof item === "object" && !Array.isArray(item),
+      )
+    : [];
+}
+
+function mergeReportEvidence(questionEvidence, evaluationEvidence) {
+  const merged = new Map();
+  for (const [items, usage] of [
+    [questionEvidence, "Question"],
+    [evaluationEvidence, "Evaluation"],
+  ]) {
+    for (const item of evidenceItems(items)) {
+      const key = JSON.stringify([
+        item.document_id || "",
+        item.filename || "",
+        item.page_number ?? "",
+        item.chunk_id || "",
+        typeof item.text === "string" ? item.text : "",
+      ]);
+      const existing = merged.get(key);
+      if (existing) {
+        existing.usage = "Question and evaluation";
+      } else {
+        merged.set(key, { ...item, usage });
+      }
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function EvidenceList({ title, items }) {
+  const evidence = evidenceItems(items);
+  if (evidence.length === 0) return null;
+
+  return (
+    <section className="evidence-list" aria-label={title}>
+      <h4>{title}</h4>
+      <ul>
+        {evidence.map((item, index) => {
+          const filename =
+            typeof item.filename === "string" && item.filename.trim()
+              ? item.filename.trim()
+              : "Source document";
+          const pageNumber = item.page_number;
+          const page =
+            pageNumber !== null &&
+            pageNumber !== undefined &&
+            String(pageNumber).trim()
+              ? `Page ${pageNumber}`
+              : null;
+          const excerpt =
+            typeof item.text === "string" && item.text.trim()
+              ? item.text.trim()
+              : "Excerpt unavailable.";
+
+          return (
+            <li
+              className="evidence-item"
+              key={`${item.document_id || filename}-${item.chunk_id || page || index}-${index}`}
+            >
+              <div className="evidence-heading">
+                <strong>{filename}</strong>
+                {page && <span>{page}</span>}
+                {item.usage && (
+                  <span className="evidence-usage">{item.usage}</span>
+                )}
+              </div>
+              <p>{excerpt}</p>
+            </li>
+          );
+        })}
+      </ul>
     </section>
   );
 }
@@ -928,7 +1026,7 @@ function FeedbackList({ title, items = [], tone }) {
   return <div className={`feedback-list ${tone}`}><h4>{title}</h4>{items?.length ? <ul>{items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul> : <p>No specific notes for this answer.</p>}</div>;
 }
 
-function Report({ report, loading, onHistory, onDashboard }) {
+export function Report({ report, loading, onHistory, onDashboard }) {
   if (!report) return <section className="content-page"><div className="panel empty-state"><h2>{loading ? "Building your report…" : "Report unavailable"}</h2></div></section>;
   return (
     <section className="content-page report-page">
@@ -938,7 +1036,7 @@ function Report({ report, loading, onHistory, onDashboard }) {
         <div className="panel summary-card"><span className="summary-icon warm">↗</span><p className="eyebrow">GROWTH AREAS</p><h2>Focus your practice</h2><FeedbackList title="" items={report.weaknesses} tone="improve" /></div>
       </div>
       <div className="panel recommendations-panel"><p className="eyebrow">YOUR NEXT STEPS</p><h2>Small improvements, stronger interviews.</h2>{report.recommendations.length ? <ol>{report.recommendations.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ol> : <p className="muted">Keep practicing with role-specific examples and clear reasoning.</p>}</div>
-      <div className="panel question-results"><div className="panel-heading compact"><div><p className="eyebrow">SESSION BREAKDOWN</p><h2>{report.role} · {report.question_count} questions</h2></div><span className="step-pill">{report.interview_type}</span></div>{report.question_results.map((item) => <article className="result-item" key={item.question_number}><div className="result-number">{String(item.question_number).padStart(2, "0")}</div><div className="result-body"><h3>{item.question}</h3><p>{item.answer}</p></div><span className="result-score">{item.score}<small>/10</small></span></article>)}</div>
+      <div className="panel question-results"><div className="panel-heading compact"><div><p className="eyebrow">SESSION BREAKDOWN</p><h2>{report.role} · {report.question_count} questions</h2></div><span className="step-pill">{report.interview_type}</span></div>{report.question_results.map((item) => <article className="result-item" key={item.question_number}><div className="result-number">{String(item.question_number).padStart(2, "0")}</div><div className="result-body"><h3>{item.question}</h3><p>{item.answer}</p><EvidenceList title="Source evidence" items={mergeReportEvidence(item.question_evidence, item.evaluation_evidence)} /></div><span className="result-score">{item.score}<small>/10</small></span></article>)}</div>
       <div className="report-actions"><button className="button button-secondary" onClick={onHistory}>View interview history</button><button className="button button-primary" onClick={onDashboard}>Start another practice <span>→</span></button></div>
     </section>
   );

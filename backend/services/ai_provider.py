@@ -218,6 +218,37 @@ class LocalInterviewProvider:
             ).strip("\"' .,;:")
             answer_excerpt = answer_excerpt or "your previous answer"
             attempt = len(metadata.get("rejected_questions", []))
+            if context_mode in {"resume", "study_material"}:
+                excerpts = self._context_excerpts(context)
+                if not excerpts:
+                    raise LLMProviderError(
+                        "No source evidence is available for this interview mode"
+                    )
+
+                answer_count = sum(
+                    1 for item in history if isinstance(item.get("question"), str)
+                )
+                excerpt = excerpts[(answer_count + attempt) % len(excerpts)]
+                if context_mode == "resume":
+                    follow_up_templates = (
+                        f'You said, "{answer_excerpt}". Your resume states '
+                        f'"{excerpt}". How does your answer connect to that experience?',
+                        f'You mentioned, "{answer_excerpt}". What specific '
+                        f'detail from your resume relates to "{excerpt}"?',
+                        f'Your answer was, "{answer_excerpt}". What would you '
+                        f'clarify about the resume experience described by "{excerpt}"?',
+                    )
+                else:
+                    follow_up_templates = (
+                        f'You said, "{answer_excerpt}". Based on this study '
+                        f'passage, "{excerpt}", how would you refine your explanation?',
+                        f'Your answer was, "{answer_excerpt}". Which idea in '
+                        f'this study passage, "{excerpt}", supports or qualifies it?',
+                        f'You mentioned, "{answer_excerpt}". How does that '
+                        f'compare with the study material: "{excerpt}"?',
+                    )
+                return follow_up_templates[attempt % len(follow_up_templates)]
+
             follow_up_templates = (
                 f'You said, "{answer_excerpt}". What reasoning led you to that answer?',
                 f'Can you clarify how you arrived at "{answer_excerpt}"?',
@@ -404,7 +435,9 @@ class LocalInterviewProvider:
 
         if len(words) >= 20:
             strengths.append(
-                "The answer provides enough detail to assess the approach."
+                "The answer meets the local evaluator's length heuristic."
+                if context_mode == "resume"
+                else "The answer provides enough detail to assess the approach."
             )
         else:
             improvements.append(
@@ -416,11 +449,22 @@ class LocalInterviewProvider:
             for marker in ("because", "trade-off", "test", "example")
         ):
             strengths.append(
-                "The answer includes reasoning or supporting detail."
+                "A reasoning or example marker is present."
+                if context_mode == "resume"
+                else "The answer includes reasoning or supporting detail."
             )
         else:
             improvements.append(
                 "Explain why the chosen approach was appropriate."
+            )
+
+        improvement_suggestions = list(improvements)
+        if context_mode == "resume":
+            improvement_suggestions.insert(
+                0,
+                "Local resume-mode scoring uses answer length and reasoning "
+                "markers; it does not assess semantic correctness or verify "
+                "claims against the resume.",
             )
 
         return EvaluationResult(
@@ -430,7 +474,7 @@ class LocalInterviewProvider:
             clarity=score,
             strengths=strengths,
             weaknesses=improvements,
-            improvement_suggestions=improvements,
+            improvement_suggestions=improvement_suggestions,
             follow_up_required=score < 7,
             next_difficulty=(
                 "hard" if score >= 8

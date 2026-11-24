@@ -215,6 +215,110 @@ def test_local_provider_questions_quote_the_selected_source():
     assert "candidate experience" not in study_question.lower()
 
 
+@pytest.mark.parametrize(
+    ("context_mode", "source_text", "source_phrase"),
+    [
+        (
+            "resume",
+            "Built a queue worker pool to reduce request latency.",
+            "Built a queue worker pool",
+        ),
+        (
+            "study_material",
+            "A queue uses FIFO ordering to process waiting tasks.",
+            "A queue uses FIFO ordering",
+        ),
+    ],
+)
+def test_local_document_followups_use_source_and_previous_answer(
+    context_mode,
+    source_text,
+    source_phrase,
+):
+    provider = LocalInterviewProvider()
+    history = [
+        {
+            "question": "How did you handle queued work?",
+            "answer": "I used three workers to reduce queue delay.",
+            "_generation_metadata": {
+                "follow_up_requested": True,
+                "follow_up_reason": "Explain the design choice.",
+                "rejected_questions": [],
+            },
+        }
+    ]
+
+    follow_up = provider.generate_question(
+        "Backend Engineer",
+        "technical",
+        "medium",
+        history,
+        build_context([source_text], context_mode),
+        context_mode=context_mode,
+    )
+
+    assert "I used three workers to reduce queue delay" in follow_up
+    assert source_phrase in follow_up
+
+
+def test_local_general_followup_behavior_is_unchanged():
+    provider = LocalInterviewProvider()
+    history = [
+        {
+            "question": "How did you handle queued work?",
+            "answer": "I used three workers to reduce queue delay.",
+            "_generation_metadata": {
+                "follow_up_requested": True,
+                "rejected_questions": [],
+            },
+        }
+    ]
+
+    assert provider.generate_question(
+        "Backend Engineer",
+        "technical",
+        "medium",
+        history,
+        "",
+    ) == (
+        'You said, "I used three workers to reduce queue delay". '
+        "What reasoning led you to that answer?"
+    )
+
+
+def test_local_resume_evaluation_discloses_heuristic_limits():
+    provider = LocalInterviewProvider()
+    answer = (
+        "I measured the queue latency because the trade-off affected "
+        "throughput, and then tested the change with a concrete example carefully."
+    )
+
+    resume_result = provider.evaluate_answer(
+        "Backend Engineer",
+        "How did you improve the service?",
+        answer,
+        "Resume evidence: Built a queue worker pool.",
+        "medium",
+        context_mode="resume",
+    )
+    general_result = provider.evaluate_answer(
+        "Backend Engineer",
+        "How did you improve the service?",
+        answer,
+        "",
+        "medium",
+    )
+
+    assert resume_result.score == general_result.score
+    assert "length heuristic" in resume_result.strengths[0]
+    assert "does not assess semantic correctness" in (
+        resume_result.improvement_suggestions[0]
+    )
+    assert "verify claims against the resume" in (
+        resume_result.improvement_suggestions[0]
+    )
+
+
 def test_llm_question_prompt_only_requests_explicit_follow_ups():
     history = [
         {
@@ -552,6 +656,134 @@ def test_study_material_interview_uses_source_only_context_and_question_query(
     )
     assert report["question_results"][0]["question_evidence"] == expected_evidence
     assert report["question_results"][0]["evaluation_evidence"] == expected_evidence
+
+
+@pytest.mark.parametrize(
+    ("document_type", "document_id", "filename", "source_text"),
+    [
+        (
+            "resume",
+            "resume-followup",
+            "resume.pdf",
+            "Built a queue worker pool to reduce request latency.",
+        ),
+        (
+            "study_material",
+            "study-followup",
+            "queue-notes.pdf",
+            "A queue uses FIFO ordering to process waiting tasks.",
+        ),
+    ],
+)
+def test_document_followup_retrieves_and_passes_the_selected_source(
+    tmp_path,
+    monkeypatch,
+    document_type,
+    document_id,
+    filename,
+    source_text,
+):
+    class FollowUpProvider:
+        name = "fake"
+
+        def __init__(self):
+            self.generated = []
+            self.evaluated = []
+
+        def generate_question(
+            self,
+            role,
+            interview_type,
+            difficulty,
+            history,
+            context,
+            context_mode="general",
+        ):
+            self.generated.append((context, context_mode, history))
+            return (
+                "How did you handle queued work?"
+                if len(self.generated) == 1
+                else "How does your answer relate to the selected source?"
+            )
+
+        def evaluate_answer(
+            self,
+            role,
+            question,
+            answer,
+            context,
+            difficulty,
+            context_mode="general",
+        ):
+            self.evaluated.append((context, context_mode))
+            return EvaluationResult(**valid_evaluation())
+
+    evidence = {
+        "document_id": document_id,
+        "filename": filename,
+        "document_type": document_type,
+        "page_number": 3,
+        "chunk_id": "selected-chunk",
+        "text": source_text,
+        "distance": 0.1,
+    }
+    retrieval_calls = []
+
+    def fake_retrieve_context(query, n_results, **filters):
+        retrieval_calls.append((query, filters))
+        return [evidence]
+
+    monkeypatch.setattr(interview, "retrieve_context", fake_retrieve_context)
+    provider = FollowUpProvider()
+    service = interview.InterviewService(
+        store=SQLiteSessionStore(tmp_path / f"{document_type}.sqlite3"),
+        provider=provider,
+    )
+    service.document_store.register(
+        document_id,
+        "user-1",
+        filename,
+        document_type=document_type,
+    )
+    session = service.start(
+        "Backend Engineer",
+        "technical",
+        "medium",
+        3,
+        document_id=document_id,
+        user_id="user-1",
+    )
+
+    first_question = service.next_question(session.session_id)
+    answer = "I used three workers to reduce queue delay."
+    evaluation = service.evaluate(
+        session.session_id,
+        first_question["question"],
+        answer,
+    )
+    follow_up = service.next_question(session.session_id)
+
+    expected_filters = {
+        "document_id": document_id,
+        "user_id": "user-1",
+        "document_type": document_type,
+    }
+    assert len(retrieval_calls) == 3
+    assert all(filters == expected_filters for _, filters in retrieval_calls)
+    assert answer in retrieval_calls[2][0]
+    assert [mode for _, mode, _ in provider.generated] == [
+        document_type,
+        document_type,
+    ]
+    assert [mode for _, mode in provider.evaluated] == [document_type]
+    assert source_text in provider.generated[1][0]
+    assert provider.generated[1][2][-1]["answer"] == answer
+    assert provider.generated[1][2][-1]["_generation_metadata"][
+        "follow_up_requested"
+    ] is True
+    assert evaluation["evidence"] == [evidence]
+    assert follow_up["is_follow_up"] is True
+    assert follow_up["evidence"] == [evidence]
 
 
 @pytest.mark.parametrize("document_type", ["resume", "study_material"])
