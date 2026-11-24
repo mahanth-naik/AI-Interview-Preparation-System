@@ -1,4 +1,5 @@
 import sqlite3
+import time
 
 import jwt
 import pytest
@@ -105,6 +106,58 @@ def test_login_me_and_logout_revoke_access_token(auth_client):
     logged_out = auth_client.post("/auth/logout", headers=headers)
     assert logged_out.status_code == 204
     assert auth_client.get("/auth/me", headers=headers).status_code == 401
+
+
+def test_revoking_newer_token_preserves_older_revocation_and_cleans_expired(
+    auth_client,
+    monkeypatch,
+):
+    credentials = {
+        "full_name": "Ada Lovelace",
+        "email": "ada@example.com",
+        "password": "a-very-long-test-password",
+    }
+    assert auth_client.post("/auth/register", json=credentials).status_code == 201
+
+    monkeypatch.setenv("JWT_ACCESS_TOKEN_MINUTES", "30")
+    older_token = auth_client.post(
+        "/auth/login",
+        json={"email": credentials["email"], "password": credentials["password"]},
+    ).json()["access_token"]
+    older_payload = jwt.decode(
+        older_token,
+        options={"verify_signature": False},
+        algorithms=["HS256"],
+    )
+
+    monkeypatch.setenv("JWT_ACCESS_TOKEN_MINUTES", "60")
+    newer_token = auth_client.post(
+        "/auth/login",
+        json={"email": credentials["email"], "password": credentials["password"]},
+    ).json()["access_token"]
+    newer_payload = jwt.decode(
+        newer_token,
+        options={"verify_signature": False},
+        algorithms=["HS256"],
+    )
+    assert older_payload["exp"] < newer_payload["exp"]
+
+    older_headers = {"Authorization": f"Bearer {older_token}"}
+    newer_headers = {"Authorization": f"Bearer {newer_token}"}
+    assert auth_client.post("/auth/logout", headers=older_headers).status_code == 204
+    assert auth_client.post("/auth/logout", headers=newer_headers).status_code == 204
+    assert auth_client.get("/auth/me", headers=older_headers).status_code == 401
+    assert auth_client.get("/auth/me", headers=newer_headers).status_code == 401
+
+    store = auth_module.user_store
+    expired_token_id = "expired-test-token"
+    store.revoke_token(expired_token_id, int(time.time()) - 1)
+    store.revoke_token("cleanup-trigger-token", newer_payload["exp"])
+
+    assert not store.is_token_revoked(expired_token_id)
+    assert store.is_token_revoked("cleanup-trigger-token")
+    assert store.is_token_revoked(older_payload["jti"])
+    assert store.is_token_revoked(newer_payload["jti"])
 
 
 def test_login_uses_same_error_for_unknown_email_and_bad_password(auth_client):

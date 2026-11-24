@@ -4,9 +4,20 @@ import { afterEach, test } from "node:test";
 import { api } from "./api.js";
 
 const originalFetch = globalThis.fetch;
+const originalWindow = globalThis.window;
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalWindow === undefined) delete globalThis.window;
+  else globalThis.window = originalWindow;
   api.clearAccessToken();
 });
 
@@ -155,6 +166,47 @@ test("an expired access token is cleared after an unauthorized response", async 
     message: "Invalid or expired access token.",
   });
   assert.equal(api.getAccessToken(), null);
+});
+
+test("a late unauthorized response cannot clear a newer account token", async () => {
+  const response = deferred();
+  const events = [];
+  globalThis.window = {
+    dispatchEvent(event) {
+      events.push(event.type);
+    },
+  };
+  api.setAccessToken("account-a-token");
+  globalThis.fetch = () => response.promise;
+
+  const request = api.listSessions();
+  api.setAccessToken("account-b-token");
+  response.resolve(
+    Response.json(
+      { detail: "Invalid or expired access token." },
+      { status: 401 },
+    ),
+  );
+
+  await assert.rejects(request, {
+    message: "Invalid or expired access token.",
+  });
+  assert.equal(api.getAccessToken(), "account-b-token");
+  assert.deepEqual(events, []);
+});
+
+test("a late logout response cannot clear a newer account token", async () => {
+  const response = deferred();
+  api.setAccessToken("account-a-token");
+  globalThis.fetch = () => response.promise;
+
+  const logout = api.logout();
+  api.setAccessToken("account-b-token");
+  response.resolve(new Response(null, { status: 204 }));
+
+  await logout;
+
+  assert.equal(api.getAccessToken(), "account-b-token");
 });
 
 test("login and registration use the expected authentication endpoints", async () => {

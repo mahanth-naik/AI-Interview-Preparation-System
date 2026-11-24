@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -97,7 +98,7 @@ class SQLiteUserStore:
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM revoked_tokens WHERE expires_at <= ?",
-                (expires_at,),
+                (int(time.time()),),
             )
             connection.execute(
                 """

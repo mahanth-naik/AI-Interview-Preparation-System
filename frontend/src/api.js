@@ -33,7 +33,7 @@ async function request(path, options = {}) {
     ...options,
     headers,
   });
-  if (response.status === 401 && token) {
+  if (response.status === 401 && token && getAccessToken() === token) {
     clearAccessToken();
     if (typeof window !== "undefined") {
       window.dispatchEvent(new Event("interviewstudio:auth-expired"));
@@ -89,10 +89,11 @@ export const api = {
   },
 
   async logout() {
+    const token = getAccessToken();
     try {
       return await request("/auth/logout", { method: "POST" });
     } finally {
-      clearAccessToken();
+      if (getAccessToken() === token) clearAccessToken();
     }
   },
 

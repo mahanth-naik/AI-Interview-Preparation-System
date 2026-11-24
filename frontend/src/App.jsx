@@ -1,13 +1,12 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "./api.js";
-
-const initialForm = {
-  role: "",
-  interview_type: "technical",
-  difficulty: "medium",
-  number_of_questions: 5,
-};
+import {
+  clearAccountState,
+  clearInterviewState,
+  createAccountRequestGuard,
+  initialForm,
+} from "./appState.js";
 
 function App() {
   const [page, setPage] = useState("dashboard");
@@ -27,15 +26,29 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const refreshSessions = useCallback(async () => {
-    const result = await api.listSessions();
-    setSessions(result.sessions);
-  }, []);
+  const accountRequestGuardRef = useRef(null);
+  if (accountRequestGuardRef.current === null) {
+    accountRequestGuardRef.current = createAccountRequestGuard();
+  }
+  const accountRequestGuard = accountRequestGuardRef.current;
 
-  const refreshDocuments = useCallback(async () => {
-    const result = await api.listDocuments();
-    setDocuments(result.documents);
-  }, []);
+  const refreshSessions = useCallback(async (context) => {
+    const requestContext = context || accountRequestGuard.capture();
+    return accountRequestGuard.run(
+      requestContext,
+      () => api.listSessions(),
+      (result) => setSessions(result.sessions),
+    );
+  }, [accountRequestGuard]);
+
+  const refreshDocuments = useCallback(async (context) => {
+    const requestContext = context || accountRequestGuard.capture();
+    return accountRequestGuard.run(
+      requestContext,
+      () => api.listDocuments(),
+      (result) => setDocuments(result.documents),
+    );
+  }, [accountRequestGuard]);
 
   useEffect(() => {
     let active = true;
@@ -46,13 +59,19 @@ function App() {
       };
     }
 
+    const context = accountRequestGuard.capture();
     api.getCurrentUser()
       .then((result) => {
-        if (active) setUser(result.user);
+        if (active && accountRequestGuard.isGenerationCurrent(context)) {
+          accountRequestGuard.activate(result.user.user_id);
+          setUser(result.user);
+        }
       })
       .catch((requestError) => {
-        api.clearAccessToken();
-        if (active) setError(requestError.message);
+        if (active && accountRequestGuard.isGenerationCurrent(context)) {
+          api.clearAccessToken();
+          setError(requestError.message);
+        }
       })
       .finally(() => {
         if (active) setAuthReady(true);
@@ -61,29 +80,53 @@ function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [accountRequestGuard]);
 
   useEffect(() => {
     if (user) {
-      refreshSessions().catch((requestError) => setError(requestError.message));
-      refreshDocuments().catch((requestError) => setError(requestError.message));
-    } else {
+      const context = accountRequestGuard.capture();
+      if (
+        !accountRequestGuard.isCurrent(context) ||
+        context.accountId !== user.user_id
+      ) {
+        return;
+      }
+      refreshSessions(context).catch((requestError) => {
+        if (accountRequestGuard.isCurrent(context)) {
+          setError(requestError.message);
+        }
+      });
+      refreshDocuments(context).catch((requestError) => {
+        if (accountRequestGuard.isCurrent(context)) {
+          setError(requestError.message);
+        }
+      });
+    } else if (accountRequestGuard.capture().accountId === null) {
       setSessions([]);
       setDocuments([]);
     }
-  }, [refreshDocuments, refreshSessions, user]);
+  }, [accountRequestGuard, refreshDocuments, refreshSessions, user]);
 
   useEffect(() => {
     function handleExpiredToken() {
+      accountRequestGuard.invalidate();
       setUser(null);
-      setSessions([]);
-      setSession(null);
-      setQuestion(null);
-      setEvaluation(null);
-      setReport(null);
+      clearAccountState({
+        setSessions,
+        setSession,
+        setQuestion,
+        setAnswer,
+        setEvaluation,
+        setReport,
+        setDocumentId,
+        setDocuments,
+        setForm,
+        setDocumentType,
+      });
       setPage("dashboard");
       setAuthMode("login");
       setError("Your session expired. Please sign in again.");
+      setLoading(false);
     }
 
     window.addEventListener("interviewstudio:auth-expired", handleExpiredToken);
@@ -93,45 +136,76 @@ function App() {
         handleExpiredToken,
       );
     };
-  }, []);
+  }, [accountRequestGuard]);
 
   async function authenticate(credentials) {
+    let context = accountRequestGuard.capture();
     setLoading(true);
     setError("");
     try {
       if (authMode === "register") {
         await api.register(credentials);
+        if (!accountRequestGuard.isGenerationCurrent(context)) return;
       }
       const result = await api.login(credentials);
+      if (!accountRequestGuard.isGenerationCurrent(context)) return;
+      accountRequestGuard.activate(result.user.user_id);
+      context = accountRequestGuard.capture();
+      clearAccountState({
+        setSessions,
+        setSession,
+        setQuestion,
+        setAnswer,
+        setEvaluation,
+        setReport,
+        setDocumentId,
+        setDocuments,
+        setForm,
+        setDocumentType,
+      });
       api.setAccessToken(result.access_token);
       setUser(result.user);
       setPage("dashboard");
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isGenerationCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isGenerationCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
   async function signOut() {
+    const context = accountRequestGuard.invalidate();
     setLoading(true);
     setError("");
     try {
       await api.logout();
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isGenerationCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setUser(null);
-      setSessions([]);
-      setSession(null);
-      setQuestion(null);
-      setEvaluation(null);
-      setReport(null);
-      setDocumentId("");
-      setDocuments([]);
-      setPage("dashboard");
-      setAuthMode("login");
-      setLoading(false);
+      if (accountRequestGuard.isGenerationCurrent(context)) {
+        setUser(null);
+        clearAccountState({
+          setSessions,
+          setSession,
+          setQuestion,
+          setAnswer,
+          setEvaluation,
+          setReport,
+          setDocumentId,
+          setDocuments,
+          setForm,
+          setDocumentType,
+        });
+        setPage("dashboard");
+        setAuthMode("login");
+        setLoading(false);
+      }
     }
   }
 
@@ -143,62 +217,91 @@ function App() {
   async function uploadDocument(event) {
     const file = event.target.files?.[0];
     if (!file) return;
+    const context = accountRequestGuard.capture();
+    if (!accountRequestGuard.isCurrent(context)) return;
     setLoading(true);
     setError("");
     try {
       const result = await api.uploadDocument(file, documentType);
+      if (!accountRequestGuard.isCurrent(context)) return;
       setDocumentId(result.document_id);
-      await refreshDocuments();
+      await refreshDocuments(context);
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
       event.target.value = "";
     }
   }
 
   async function deleteDocument(documentIdToDelete) {
     if (!documentIdToDelete) return;
+    const context = accountRequestGuard.capture();
+    if (!accountRequestGuard.isCurrent(context)) return;
     setLoading(true);
     setError("");
     try {
       await api.deleteDocument(documentIdToDelete);
+      if (!accountRequestGuard.isCurrent(context)) return;
       if (documentId === documentIdToDelete) setDocumentId("");
-      await refreshDocuments();
+      await refreshDocuments(context);
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
   async function startInterview(event) {
     event.preventDefault();
+    const context = accountRequestGuard.capture();
+    if (!accountRequestGuard.isCurrent(context)) return;
+    clearInterviewState({
+      setSession,
+      setQuestion,
+      setAnswer,
+      setEvaluation,
+      setReport,
+    });
     setLoading(true);
     setError("");
-    setEvaluation(null);
-    setReport(null);
     try {
       const created = await api.startInterview({
         ...form,
         number_of_questions: Number(form.number_of_questions),
         document_id: documentId || null,
       });
+      if (!accountRequestGuard.isCurrent(context)) return;
       setSession(created);
       setPage("room");
       const firstQuestion = await api.getQuestion(created.session_id);
+      if (!accountRequestGuard.isCurrent(context)) return;
       setQuestion(firstQuestion);
-      await refreshSessions();
+      await refreshSessions(context);
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
   async function submitAnswer(event) {
     event.preventDefault();
     if (!session || !question?.question || !answer.trim()) return;
+    const context = accountRequestGuard.capture();
+    if (!accountRequestGuard.isCurrent(context)) return;
     setLoading(true);
     setError("");
     try {
@@ -207,67 +310,102 @@ function App() {
         question: question.question,
         answer: answer.trim(),
       });
+      if (!accountRequestGuard.isCurrent(context)) return;
       setEvaluation(result);
       setAnswer("");
-      await refreshSessions();
+      await refreshSessions(context);
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
   async function loadNextQuestion() {
     if (!session) return;
+    const context = accountRequestGuard.capture();
+    if (!accountRequestGuard.isCurrent(context)) return;
     setLoading(true);
     setError("");
     try {
       const next = await api.getQuestion(session.session_id);
+      if (!accountRequestGuard.isCurrent(context)) return;
       setQuestion(next);
       setEvaluation(null);
       setAnswer("");
       if (next.status === "completed" || !next.question) {
-        await openReport(session.session_id);
+        await openReport(session.session_id, context);
       }
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
-  async function openReport(sessionId) {
+  async function openReport(
+    sessionId,
+    context = accountRequestGuard.capture(),
+  ) {
+    if (!accountRequestGuard.isCurrent(context)) return;
     setLoading(true);
     setError("");
     try {
       const result = await api.getReport(sessionId);
+      if (!accountRequestGuard.isCurrent(context)) return;
       setReport(result);
       setPage("report");
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
   async function resumeInterview(sessionId) {
+    const context = accountRequestGuard.capture();
+    if (!accountRequestGuard.isCurrent(context)) return;
+    clearInterviewState({
+      setSession,
+      setQuestion,
+      setAnswer,
+      setEvaluation,
+      setReport,
+    });
     setLoading(true);
     setError("");
-    setEvaluation(null);
-    setReport(null);
     try {
       const restored = await api.getSession(sessionId);
+      if (!accountRequestGuard.isCurrent(context)) return;
       setSession(restored);
       if (restored.status === "completed") {
-        await openReport(sessionId);
+        await openReport(sessionId, context);
       } else {
         setPage("room");
-        setQuestion(await api.getQuestion(sessionId));
+        const nextQuestion = await api.getQuestion(sessionId);
+        if (!accountRequestGuard.isCurrent(context)) return;
+        setQuestion(nextQuestion);
       }
     } catch (requestError) {
-      setError(requestError.message);
+      if (accountRequestGuard.isCurrent(context)) {
+        setError(requestError.message);
+      }
     } finally {
-      setLoading(false);
+      if (accountRequestGuard.isCurrent(context)) {
+        setLoading(false);
+      }
     }
   }
 
